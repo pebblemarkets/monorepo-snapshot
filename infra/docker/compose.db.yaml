@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pebble
+      POSTGRES_PASSWORD: pebble
+      POSTGRES_DB: pebble
+    ports:
+      - "5432:5432"
+    volumes:
+      - pebble-postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - pebble-redis:/data
+
+volumes:
+  pebble-postgres:
+  pebble-redis:
+

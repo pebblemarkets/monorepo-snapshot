@@ -1,0 +1,167 @@
+module Pebble.Scripts.M1 where
+
+import Daml.Script
+import DA.Text (isPrefixOf)
+
+import Pebble.Account as Account
+import Pebble.Clearing as Clearing
+import Pebble.Reference as Ref
+import Pebble.Types as Types
+
+partyMatchesHint : Text -> Party -> Bool
+partyMatchesHint hint p =
+  let partyText = show p
+      prefix = hint <> "::"
+   in prefix `isPrefixOf` partyText
+        || ("party " <> prefix) `isPrefixOf` partyText
+        || ("party '" <> prefix) `isPrefixOf` partyText
+        || ("party \"" <> prefix) `isPrefixOf` partyText
+        || ("'" <> prefix) `isPrefixOf` partyText
+        || ("\"" <> prefix) `isPrefixOf` partyText
+
+getOrAllocateParty : Text -> Script Party
+getOrAllocateParty hint = do
+  known <- listKnownParties
+  case filter (\pd -> partyMatchesHint hint pd.party) known of
+    (pd :: _) -> pure pd.party
+    [] -> allocatePartyByHint (PartyIdHint hint)
+
+-- M1 acceptance script:
+-- - creates core reference contracts,
+-- - creates an account (AccountRef + AccountState),
+-- - creates a clearing head and anchors a batch,
+-- - applies clearing deltas with invariant checks,
+-- - exercises account lifecycle transitions.
+--
+-- Run (example):
+--   daml script --dar .daml/dist/pebble-scripts-0.1.0.dar --script-name Pebble.Scripts.M1:testM1
+testM1 : Script ()
+testM1 = script do
+  committee <- getOrAllocateParty "PebbleCommittee"
+  alice <- getOrAllocateParty "Alice"
+  instrumentAdmin <- getOrAllocateParty "InstrumentAdmin"
+
+  let instrumentId : Types.InstrumentId = "TEST"
+  let engineVersion = Types.EngineVersion with value = "m1"
+
+  -- Reference contracts (minimal fields; values match the LocalNet/DevNet profile intent).
+  _tokenCfgCid <- submit committee do
+    createCmd Ref.TokenConfig with
+      committee
+      instrumentAdmin
+      instrumentId
+      registryUrl = "http://localhost:0"
+      depositMode = Ref.OfferAcceptOnly
+      inboundRequiresAcceptance = True
+      decimals = 2
+      symbol = "TST"
+      hardMaxInputsPerTransfer = 100
+      operationalMaxInputsPerTransfer = 80
+      targetUtxoCountMin = 20
+      targetUtxoCountMax = 50
+      dustThresholdMinor = 1
+      withdrawalFeeHeadroomMinor = 0
+      unexpectedFeeBufferMinor = 0
+      requiresDepositIdMetadata = True
+      allowedDepositPendingStatusClasses = ["TransferPendingInternalWorkflow"]
+      allowedWithdrawalPendingStatusClasses = ["TransferPendingReceiverAcceptance", "TransferPendingInternalWorkflow"]
+      allowedCancelPendingStatusClasses = ["TransferPendingInternalWorkflow"]
+      requiresOriginalInstructionCid = False
+      auditor = None
+
+  _feeCid <- submit committee do
+    createCmd Ref.FeeSchedule with
+      committee
+      instrumentAdmin
+      instrumentId
+      depositPolicy = Ref.CreditObservedReceived
+      withdrawalPolicy = Ref.TreasurySubsidized
+      auditor = None
+
+  _oracleCid <- submit committee do
+    createCmd Ref.OracleConfig with
+      committee
+      instrumentAdmin
+      instrumentId
+      mode = Ref.CommitteeResolution
+      auditor = None
+
+  -- Clearing head (genesis).
+  headCid <- submit committee do
+    createCmd Clearing.ClearingHead with
+      committee
+      instrumentAdmin
+      instrumentId
+      nextEpoch = 1
+      prevBatchHash = "GENESIS"
+      engineVersion
+      lastBatchAnchor = None
+
+  -- Account creation.
+  let accountId : Types.AccountId = "acc-1"
+  refCid <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stCid0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  -- Debit must fail at zero.
+  submitMustFail committee do
+    exerciseCmd stCid0 Account.Debit with amountMinor = 1
+
+  stCid1 <- submit committee do
+    exerciseCmd stCid0 Account.Credit with amountMinor = 10
+
+  -- Anchor epoch 1 and apply a delta.
+  (headCid1, anchorCid1) <- submit committee do
+    exerciseCmd headCid Clearing.CreateNextBatch with batchHash = "h1"
+
+  stCid2 <- submit committee do
+    exerciseCmd stCid1 Account.ApplyClearingDelta with batchAnchorCid = anchorCid1, deltaMinor = -3
+
+  -- Applying the same epoch again must fail.
+  submitMustFail committee do
+    exerciseCmd stCid2 Account.ApplyClearingDelta with batchAnchorCid = anchorCid1, deltaMinor = 0
+
+  -- Negative cleared cash must fail.
+  submitMustFail committee do
+    exerciseCmd stCid2 Account.ApplyClearingDelta with batchAnchorCid = anchorCid1, deltaMinor = -100
+
+  -- Account lifecycle: request exit (owner), then finalize suspension (committee).
+  refCid1 <- submit alice do
+    exerciseCmd refCid Account.RequestExit
+
+  refCid2 <- submit committee do
+    exerciseCmd refCid1 Account.FinalizeSuspension with epoch = 1
+
+  -- Closing while cleared cash != 0 must fail.
+  submitMustFail committee do
+    exerciseCmd refCid2 Account.CloseAccount with accountStateCid = stCid2
+
+  -- Bring cleared cash back to zero and close.
+  stCid3 <- submit committee do
+    exerciseCmd stCid2 Account.Debit with amountMinor = 7
+
+  _refCidClosed <- submit committee do
+    exerciseCmd refCid2 Account.CloseAccount with accountStateCid = stCid3
+
+  -- Anchor epoch 2 to ensure the clearing head can progress without error.
+  _ <- submit committee do
+    exerciseCmd headCid1 Clearing.CreateNextBatch with batchHash = "h2"
+
+  pure ()

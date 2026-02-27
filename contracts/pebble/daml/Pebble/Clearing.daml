@@ -1,0 +1,122 @@
+module Pebble.Clearing where
+
+import Pebble.Types as Types
+
+-- Clearing is anchored on-ledger via a linear, hash-chained sequence of BatchAnchors.
+-- Each instrument has a single active ClearingHead contract which produces the next anchor.
+
+data BatchAnchorView = BatchAnchorView
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    epoch : Types.Epoch
+    prevBatchHash : Text
+    batchHash : Text
+    engineVersion : Types.EngineVersion
+  deriving (Eq, Show)
+
+template BatchAnchor
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    epoch : Types.Epoch
+    prevBatchHash : Text
+    batchHash : Text
+    engineVersion : Types.EngineVersion
+  where
+    signatory committee
+
+    ensure
+      Types.nonEmptyText instrumentId
+        && epoch > 0
+        && Types.nonEmptyText prevBatchHash
+        && Types.nonEmptyText batchHash
+        && Types.nonEmptyText engineVersion.value
+
+    nonconsuming choice FetchBatchAnchor : BatchAnchorView
+      with
+        requester : Party
+      controller requester
+      do
+        pure BatchAnchorView
+          with
+            committee
+            instrumentAdmin
+            instrumentId
+            epoch
+            prevBatchHash
+            batchHash
+            engineVersion
+
+data ClearingHeadView = ClearingHeadView
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    nextEpoch : Types.Epoch
+    prevBatchHash : Text
+    engineVersion : Types.EngineVersion
+    lastBatchAnchor : Optional (ContractId BatchAnchor)
+  deriving (Eq, Show)
+
+template ClearingHead
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    -- Next epoch to be anchored (monotonic).
+    nextEpoch : Types.Epoch
+    -- Batch hash from the previous epoch (genesis seed for epoch=1).
+    prevBatchHash : Text
+    engineVersion : Types.EngineVersion
+    lastBatchAnchor : Optional (ContractId BatchAnchor)
+  where
+    signatory committee
+
+    ensure
+      Types.nonEmptyText instrumentId
+        && nextEpoch > 0
+        && Types.nonEmptyText prevBatchHash
+        && Types.nonEmptyText engineVersion.value
+        && (nextEpoch == 1) == (lastBatchAnchor == None)
+
+    choice CreateNextBatch : (ContractId ClearingHead, ContractId BatchAnchor)
+      with
+        batchHash : Text
+      controller committee
+      do
+        assertMsg "batchHash must be non-empty" (Types.nonEmptyText batchHash)
+
+        let epoch = nextEpoch
+        anchorCid <- create BatchAnchor with
+          committee
+          instrumentAdmin
+          instrumentId
+          epoch
+          prevBatchHash
+          batchHash
+          engineVersion
+
+        headCid <- create this with
+          nextEpoch = nextEpoch + 1
+          prevBatchHash = batchHash
+          lastBatchAnchor = Some anchorCid
+
+        pure (headCid, anchorCid)
+
+    nonconsuming choice FetchClearingHead : ClearingHeadView
+      with
+        requester : Party
+      controller requester
+      do
+        pure ClearingHeadView
+          with
+            committee
+            instrumentAdmin
+            instrumentId
+            nextEpoch
+            prevBatchHash
+            engineVersion
+            lastBatchAnchor

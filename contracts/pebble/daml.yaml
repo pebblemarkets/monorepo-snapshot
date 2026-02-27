@@ -1,0 +1,9 @@
+sdk-version: 3.4.10
+name: pebble
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  # Keep `daml-script` in `pebble-scripts` to avoid unused-dependency warnings here.
+  - ../wizardcat-token-standard/.daml/dist/wizardcat-token-standard-0.1.0.dar

@@ -1,0 +1,36 @@
+module Pebble.Types where
+
+-- Core shared types for Pebble contracts.
+--
+-- Notes:
+-- - Daml `Int` is a 64-bit signed integer (Ledger API: int64).
+-- - Token identity is (instrumentAdmin, instrumentId).
+
+type AccountId = Text
+type MarketId = Text
+type InstrumentId = Text
+type AmountMinor = Int
+type Epoch = Int
+
+data Instrument = Instrument
+  with
+    instrumentAdmin : Party
+    instrumentId : InstrumentId
+  deriving (Eq, Show)
+
+data EngineVersion = EngineVersion
+  with
+    value : Text
+  deriving (Eq, Show)
+
+contains : Eq a => a -> [a] -> Bool
+contains _ [] = False
+contains x (y :: ys) = x == y || contains x ys
+
+allUnique : Eq a => [a] -> Bool
+allUnique [] = True
+allUnique (x :: xs) = not (contains x xs) && allUnique xs
+
+nonEmptyText : Text -> Bool
+nonEmptyText t = t /= ""
+

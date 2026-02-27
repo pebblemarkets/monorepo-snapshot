@@ -1,0 +1,51 @@
+module Pebble.MarketLifecycle where
+
+data MarketStatus = Open | Closed | Resolved
+  deriving (Eq, Show)
+
+contains : Eq a => a -> [a] -> Bool
+contains _ [] = False
+contains x (y :: ys) = x == y || contains x ys
+
+allUnique : Eq a => [a] -> Bool
+allUnique [] = True
+allUnique (x :: xs) = not (contains x xs) && allUnique xs
+
+template MarketLifecycle
+  with
+    committee : Party
+    creator : Party
+    marketId : Text
+    question : Text
+    outcomes : [Text]
+    status : MarketStatus
+    resolvedOutcome : Optional Text
+  where
+    signatory committee
+    observer creator
+
+    ensure
+      length outcomes >= 2
+        && allUnique outcomes
+        && (case status of
+          Resolved -> resolvedOutcome /= None
+          _ -> resolvedOutcome == None)
+
+    choice Close
+      : ContractId MarketLifecycle
+      controller committee
+      do
+        assertMsg "Market is not open" (status == Open)
+        create this with status = Closed
+
+    choice Resolve
+      : ContractId MarketLifecycle
+      with
+        outcome : Text
+      controller committee
+      do
+        assertMsg "Market is not closed" (status == Closed)
+        assertMsg "Outcome is not allowed" (outcome `elem` outcomes)
+        create this with
+          status = Resolved
+          resolvedOutcome = Some outcome

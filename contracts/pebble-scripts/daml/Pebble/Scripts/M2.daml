@@ -1,0 +1,757 @@
+module Pebble.Scripts.M2 where
+
+import Daml.Script
+import DA.Assert (assertMsg)
+import DA.Text (isPrefixOf)
+import qualified DA.TextMap as TM
+
+import Pebble.Account as Account
+import Pebble.Clearing as Clearing
+import qualified Pebble.MarketLifecycle as Market
+import Pebble.Reference as Ref
+import Pebble.Treasury as Treasury
+import Pebble.Types as Types
+import qualified Wizardcat.Token.Standard as Token
+
+import qualified Pebble.Scripts.M1 as M1
+
+data M2Summary = M2Summary
+  with
+    committee : Party
+    alice : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    accountId : Types.AccountId
+
+    afterDepositClearedCashMinor : Types.AmountMinor
+    afterWithdrawal1ClearedCashMinor : Types.AmountMinor
+    finalClearedCashMinor : Types.AmountMinor
+
+    depositId : Text
+    depositOfferInstructionCid : Text
+    depositAcceptedInstructionCid : Text
+    depositTerminalInstructionCid : Text
+    depositReceiptCid : Text
+    depositReceiverHoldingCids : [Text]
+
+    withdrawal1Id : Text
+    withdrawal1InstructionCid : Text
+    withdrawal1TerminalInstructionCid : Text
+    withdrawal1ReceiptCid : Text
+
+    withdrawal2Id : Text
+    withdrawal2InstructionCid : Text
+    withdrawal2ReceiptCid : Text
+
+    committeeHoldingsTotalMinor : Types.AmountMinor
+    committeeHoldingsCids : [Text]
+    aliceHoldingsTotalMinor : Types.AmountMinor
+    aliceHoldingsCids : [Text]
+  deriving (Eq, Show)
+
+expectSome : Text -> Optional a -> Script a
+expectSome msg opt =
+  case opt of
+    Some x -> pure x
+    None -> abort msg
+
+unlockedHoldingsOwnedBy : Party -> Types.InstrumentId -> Script [(ContractId Token.Holding, Token.Holding)]
+unlockedHoldingsOwnedBy p instrumentId = do
+  hs <- query @Token.Holding p
+  pure (filter (\(_, h) -> h.owner == p && h.instrumentId == instrumentId && h.lock == None) hs)
+
+holdingsByOrigin : Party -> Types.InstrumentId -> ContractId Token.TransferInstruction -> Script [ContractId Token.Holding]
+holdingsByOrigin p instrumentId rootCid = do
+  hs <- unlockedHoldingsOwnedBy p instrumentId
+  pure (map fst (filter (\(_, h) -> h.originInstructionCid == Some rootCid) hs))
+
+holdingClaimsByOrigin : Party -> Types.InstrumentId -> ContractId Token.TransferInstruction -> Script [ContractId Token.HoldingClaim]
+holdingClaimsByOrigin p instrumentId rootCid = do
+  cs <- query @Token.HoldingClaim p
+  pure (map fst (filter (\(_, c) -> c.owner == p && c.instrumentId == instrumentId && c.originInstructionCid == Some rootCid) cs))
+
+forEachS_ : [a] -> (a -> Script ()) -> Script ()
+forEachS_ xs f =
+  case xs of
+    [] -> pure ()
+    x :: rest -> do
+      f x
+      forEachS_ rest f
+
+nextRunSuffixByInstrumentPrefix : Party -> Text -> Script Text
+nextRunSuffixByInstrumentPrefix committee instrumentPrefix = do
+  cfgs <- query @Ref.TokenConfig committee
+  let runCount =
+        length
+          (filter
+            (\(_, cfg) -> instrumentPrefix `isPrefixOf` cfg.instrumentId)
+            cfgs)
+  pure (show (runCount + 1))
+
+-- M2 acceptance script:
+-- - creates a dev-only mock CIP-56 token config + wallets and bootstraps a holding
+-- - runs a deposit: Offer -> Accept(Pending) -> Advance(Completed) -> FinalizeCompleted (credit)
+-- - runs a withdrawal: Process (debit) -> Accept(Completed) -> FinalizeAccepted
+-- - runs a withdrawal cancellation: Process (debit) -> CancelAndMaybeRefund (refund)
+testM2 : Script M2Summary
+testM2 = script do
+  committee <- M1.getOrAllocateParty "PebbleCommittee"
+  alice <- M1.getOrAllocateParty "Alice"
+  instrumentAdmin <- M1.getOrAllocateParty "WizardcatInstrumentAdmin"
+
+  let instrumentId : Types.InstrumentId = "WIZARDCAT-USD-DEV-M2"
+  let engineVersion = Types.EngineVersion with value = "m2"
+
+  tokenCfgCid <- submit committee do
+    createCmd Ref.TokenConfig with
+      committee
+      instrumentAdmin
+      instrumentId
+      registryUrl = "dev://wizardcat.xyz/pebble/mock-cip56-registry"
+      depositMode = Ref.OfferAcceptOnly
+      inboundRequiresAcceptance = True
+      decimals = 2
+      symbol = "WUSDDEV"
+      hardMaxInputsPerTransfer = 100
+      operationalMaxInputsPerTransfer = 80
+      targetUtxoCountMin = 20
+      targetUtxoCountMax = 50
+      dustThresholdMinor = 1
+      withdrawalFeeHeadroomMinor = 0
+      unexpectedFeeBufferMinor = 0
+      requiresDepositIdMetadata = True
+      allowedDepositPendingStatusClasses = [Token.statusClassInternalWorkflow]
+      allowedWithdrawalPendingStatusClasses = [Token.statusClassReceiverAcceptance, Token.statusClassInternalWorkflow]
+      allowedCancelPendingStatusClasses = [Token.statusClassInternalWorkflow]
+      requiresOriginalInstructionCid = True
+      auditor = None
+
+  -- M2 convenience: initialize clearing + one example market so later M2/M3 scripts can build on
+  -- the same ledger setup without requiring a separate M1 bootstrap call.
+  headCid0 <- submit committee do
+    createCmd Clearing.ClearingHead with
+      committee
+      instrumentAdmin
+      instrumentId
+      nextEpoch = 1
+      prevBatchHash = "GENESIS"
+      engineVersion
+      lastBatchAnchor = None
+
+  (_headCid1, _anchorCid1) <- submit committee do
+    exerciseCmd headCid0 Clearing.CreateNextBatch with batchHash = "m2-h1"
+
+  _marketCid <- submit committee do
+    createCmd Market.MarketLifecycle with
+      committee
+      creator = alice
+      marketId = "m2-market-1"
+      question = "Will Pebble M2 initialization succeed?"
+      outcomes = ["YES", "NO"]
+      status = Market.Open
+      resolvedOutcome = None
+
+  let accountId : Types.AccountId = "acc-m2-1"
+
+  refCid0 <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stCid0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  aliceWalletCid <- submit alice do
+    createCmd Token.Wallet with
+      owner = alice
+      instrumentAdmin
+      instrumentId
+
+  committeeWalletCid <- submit committee do
+    createCmd Token.Wallet with
+      owner = committee
+      instrumentAdmin
+      instrumentId
+
+  -- Bootstrap Alice with an unlocked holding via a dev-only faucet.
+  -- The faucet mints a HoldingClaim (admin-signed) which Alice then claims to create an owner-signed Holding.
+  faucetCid <- submit instrumentAdmin do
+    createCmd Token.Faucet with
+      instrumentAdmin
+      instrumentId
+
+  aliceClaimCid0 <- submit instrumentAdmin do
+    exerciseCmd faucetCid Token.Mint with
+      owner = alice
+      amountMinor = 100
+
+  aliceHoldingCid0 <- submit alice do
+    exerciseCmd aliceClaimCid0 Token.Claim
+
+  now <- getTime
+
+  -- Deposit: Alice offers 10 to committee. Committee accepts; token workflow goes Pending then Completed.
+  let depositId = "dep-m2-1"
+  let depositAmount : Types.AmountMinor = 10
+  let depositMd =
+        TM.fromList
+          [ (Treasury.metaAccountIdKey, accountId)
+          , (Treasury.metaDepositIdKey, depositId)
+          , ("wizardcat.xyz/mock.acceptOutcome", "Pending")
+          ]
+
+  offerInstrCid <- submit alice do
+    exerciseCmd aliceWalletCid Token.Offer with
+      receiver = committee
+      amountMinor = depositAmount
+      inputHoldingCids = [aliceHoldingCid0]
+      metadata = depositMd
+      reason = accountId
+      lockExpiresAt = now
+
+  depReqCid <- submit committee do
+    createCmd Treasury.DepositRequest with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      depositId
+      tokenConfigCid = tokenCfgCid
+      accountStateCid = stCid0
+      offerInstructionCid = offerInstrCid
+
+  depAcceptRes <- submit committee do
+    exerciseCmd depReqCid Treasury.AcceptOffer
+
+  depPendingCid <- expectSome "expected DepositPending (offer accept should be Pending)" depAcceptRes.depositPendingCid
+
+  terminalDepInstrCid <- submit instrumentAdmin do
+    exerciseCmd depAcceptRes.acceptedInstructionCid Token.Advance
+
+  claimCids <- holdingClaimsByOrigin committee instrumentId offerInstrCid
+  assertMsg "expected holding claims for deposit receiver" (not (null claimCids))
+  forEachS_ claimCids (\claimCid -> do
+    _ <- submit committee do
+      exerciseCmd claimCid Token.Claim
+    pure ()
+    )
+
+  receiverHoldingCids <- holdingsByOrigin committee instrumentId offerInstrCid
+  assertMsg "expected committee receiver holdings for deposit" (not (null receiverHoldingCids))
+
+  (stCid1, depReceiptCid) <- submit committee do
+    exerciseCmd depPendingCid Treasury.FinalizeCompleted with
+      accountStateCid = stCid0
+      terminalInstructionCid = terminalDepInstrCid
+      receiverHoldingCids
+
+  stView1 <- submit committee do
+    exerciseCmd stCid1 Account.Fetch with requester = committee
+  assertMsg "expected deposit credit" (stView1.clearedCashMinor == depositAmount)
+
+  -- Suspend the account (epoch 0 is enough for M2; lastAppliedEpoch starts at 0).
+  refCid1 <- submit alice do
+    exerciseCmd refCid0 Account.RequestExit
+
+  refCid2 <- submit committee do
+    exerciseCmd refCid1 Account.FinalizeSuspension with epoch = 0
+
+  -- Withdrawal: debit on Process, then receiver accepts, then committee finalizes acceptance.
+  let wdId1 = "wd-m2-1"
+  let wdAmount1 : Types.AmountMinor = 3
+  let wdMd1 =
+        TM.fromList
+          [ (Treasury.metaAccountIdKey, accountId)
+          , (Treasury.metaWithdrawalIdKey, wdId1)
+          ]
+
+  wdReqCid1 <- submit alice do
+    createCmd Treasury.WithdrawalRequest with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      withdrawalId = wdId1
+      amountMinor = wdAmount1
+
+  committeeInputs1 <- holdingsByOrigin committee instrumentId offerInstrCid
+  wdProc1 <- submit committee do
+    exerciseCmd wdReqCid1 Treasury.Process with
+      tokenConfigCid = tokenCfgCid
+      accountRefCid = refCid2
+      accountStateCid = stCid1
+      committeeWalletCid
+      inputHoldingCids = committeeInputs1
+      metadata = wdMd1
+      reason = accountId
+      lockExpiresAt = now
+
+  stViewAfterDebit1 <- submit committee do
+    exerciseCmd wdProc1.newAccountStateCid Account.Fetch with requester = committee
+  assertMsg "expected withdrawal debit" (stViewAfterDebit1.clearedCashMinor == depositAmount - wdAmount1)
+
+  terminalWdInstrCid1 <- submit alice do
+    exerciseCmd wdProc1.instructionCid Token.Accept
+
+  wdReceiptCid1 <- submit committee do
+    exerciseCmd wdProc1.withdrawalPendingCid Treasury.FinalizeAccepted with
+      terminalInstructionCid = terminalWdInstrCid1
+
+  -- Withdrawal cancellation: debit on Process, then committee cancels before acceptance and gets refunded.
+  let wdId2 = "wd-m2-2"
+  let wdAmount2 : Types.AmountMinor = 2
+  let wdMd2 =
+        TM.fromList
+          [ (Treasury.metaAccountIdKey, accountId)
+          , (Treasury.metaWithdrawalIdKey, wdId2)
+          ]
+
+  wdReqCid2 <- submit alice do
+    createCmd Treasury.WithdrawalRequest with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      withdrawalId = wdId2
+      amountMinor = wdAmount2
+
+  committeeInputs2 <- do
+    hs <- unlockedHoldingsOwnedBy committee instrumentId
+    pure (map fst hs)
+
+  wdProc2 <- submit committee do
+    exerciseCmd wdReqCid2 Treasury.Process with
+      tokenConfigCid = tokenCfgCid
+      accountRefCid = refCid2
+      accountStateCid = wdProc1.newAccountStateCid
+      committeeWalletCid
+      inputHoldingCids = committeeInputs2
+      metadata = wdMd2
+      reason = accountId
+      lockExpiresAt = now
+
+  cancelRes <- submit committee do
+    exerciseCmd wdProc2.withdrawalPendingCid Treasury.CancelAndMaybeRefund with
+      accountStateCid = wdProc2.newAccountStateCid
+
+  let (_, refundedStOpt, receiptOpt2) = cancelRes
+  refundedStCid <- expectSome "expected refund AccountState CID on cancel" refundedStOpt
+  wdReceiptCid2 <- expectSome "expected WithdrawalReceipt CID on cancel" receiptOpt2
+
+  stViewAfterRefund <- submit committee do
+    exerciseCmd refundedStCid Account.Fetch with requester = committee
+  assertMsg "expected withdrawal cancel refund" (stViewAfterRefund.clearedCashMinor == depositAmount - wdAmount1)
+
+  committeeHs <- unlockedHoldingsOwnedBy committee instrumentId
+  aliceHs <- unlockedHoldingsOwnedBy alice instrumentId
+
+  let committeeTotal = foldl (+) 0 (map (\(_, h) -> h.amountMinor) committeeHs)
+  let aliceTotal = foldl (+) 0 (map (\(_, h) -> h.amountMinor) aliceHs)
+
+  pure M2Summary with
+    committee
+    alice
+    instrumentAdmin
+    instrumentId
+    accountId
+    afterDepositClearedCashMinor = stView1.clearedCashMinor
+    afterWithdrawal1ClearedCashMinor = stViewAfterDebit1.clearedCashMinor
+    finalClearedCashMinor = stViewAfterRefund.clearedCashMinor
+    depositId
+    depositOfferInstructionCid = show offerInstrCid
+    depositAcceptedInstructionCid = show depAcceptRes.acceptedInstructionCid
+    depositTerminalInstructionCid = show terminalDepInstrCid
+    depositReceiptCid = show depReceiptCid
+    depositReceiverHoldingCids = map show receiverHoldingCids
+    withdrawal1Id = wdId1
+    withdrawal1InstructionCid = show wdProc1.instructionCid
+    withdrawal1TerminalInstructionCid = show terminalWdInstrCid1
+    withdrawal1ReceiptCid = show wdReceiptCid1
+    withdrawal2Id = wdId2
+    withdrawal2InstructionCid = show wdProc2.instructionCid
+    withdrawal2ReceiptCid = show wdReceiptCid2
+    committeeHoldingsTotalMinor = committeeTotal
+    committeeHoldingsCids = map (\(cid, _) -> show cid) committeeHs
+    aliceHoldingsTotalMinor = aliceTotal
+    aliceHoldingsCids = map (\(cid, _) -> show cid) aliceHs
+
+-- M2 hardening: enforce per-instrument minimum deposit threshold.
+-- We currently treat `TokenConfig.dustThresholdMinor` as the minimum allowed deposit amount.
+testM2DepositThreshold : Script ()
+testM2DepositThreshold = script do
+  committee <- M1.getOrAllocateParty "PebbleCommittee"
+  alice <- M1.getOrAllocateParty "AliceM2Threshold"
+  instrumentAdmin <- M1.getOrAllocateParty "WizardcatInstrumentAdmin"
+
+  runSuffix <- nextRunSuffixByInstrumentPrefix committee "WIZARDCAT-USD-DEV-M2-THRESH-"
+
+  let instrumentId : Types.InstrumentId = "WIZARDCAT-USD-DEV-M2-THRESH-" <> runSuffix
+  let accountId : Types.AccountId = "acc-m2-threshold-" <> runSuffix
+  let minDeposit : Types.AmountMinor = 5
+  let tooSmallDeposit : Types.AmountMinor = 4
+
+  tokenCfgCid <- submit committee do
+    createCmd Ref.TokenConfig with
+      committee
+      instrumentAdmin
+      instrumentId
+      registryUrl = "dev://wizardcat.xyz/pebble/mock-cip56-registry"
+      depositMode = Ref.OfferAcceptOnly
+      inboundRequiresAcceptance = True
+      decimals = 2
+      symbol = "WUSDDEV"
+      hardMaxInputsPerTransfer = 100
+      operationalMaxInputsPerTransfer = 80
+      targetUtxoCountMin = 20
+      targetUtxoCountMax = 50
+      dustThresholdMinor = minDeposit
+      withdrawalFeeHeadroomMinor = 0
+      unexpectedFeeBufferMinor = 0
+      requiresDepositIdMetadata = True
+      allowedDepositPendingStatusClasses = [Token.statusClassInternalWorkflow]
+      allowedWithdrawalPendingStatusClasses = [Token.statusClassReceiverAcceptance, Token.statusClassInternalWorkflow]
+      allowedCancelPendingStatusClasses = [Token.statusClassInternalWorkflow]
+      requiresOriginalInstructionCid = True
+      auditor = None
+
+  _refCid <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stCid0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  aliceWalletCid <- submit alice do
+    createCmd Token.Wallet with
+      owner = alice
+      instrumentAdmin
+      instrumentId
+
+  faucetCid <- submit instrumentAdmin do
+    createCmd Token.Faucet with
+      instrumentAdmin
+      instrumentId
+
+  aliceClaimCid0 <- submit instrumentAdmin do
+    exerciseCmd faucetCid Token.Mint with
+      owner = alice
+      amountMinor = 100
+
+  aliceHoldingCid0 <- submit alice do
+    exerciseCmd aliceClaimCid0 Token.Claim
+
+  now <- getTime
+  let depositId = "dep-m2-threshold-too-small"
+  let md =
+        TM.fromList
+          [ (Treasury.metaAccountIdKey, accountId)
+          , (Treasury.metaDepositIdKey, depositId)
+          , ("wizardcat.xyz/mock.acceptOutcome", "Completed")
+          ]
+
+  offerInstrCid <- submit alice do
+    exerciseCmd aliceWalletCid Token.Offer with
+      receiver = committee
+      amountMinor = tooSmallDeposit
+      inputHoldingCids = [aliceHoldingCid0]
+      metadata = md
+      reason = accountId
+      lockExpiresAt = now
+
+  depReqCid <- submit committee do
+    createCmd Treasury.DepositRequest with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      depositId
+      tokenConfigCid = tokenCfgCid
+      accountStateCid = stCid0
+      offerInstructionCid = offerInstrCid
+
+  cfgView <- submit committee do
+    exerciseCmd tokenCfgCid Ref.FetchTokenConfig with requester = committee
+  assertMsg "sanity: expected threshold config value" (cfgView.dustThresholdMinor == minDeposit)
+
+  offerView <- submit committee do
+    exerciseCmd offerInstrCid Token.View with requester = committee
+  assertMsg "sanity: expected offer amount below threshold" (offerView.amountMinor == tooSmallDeposit && offerView.amountMinor < cfgView.dustThresholdMinor)
+
+  submitMustFail committee do
+    exerciseCmd depReqCid Treasury.AcceptOffer
+
+  stView <- submit committee do
+    exerciseCmd stCid0 Account.Fetch with requester = committee
+  assertMsg "too-small deposit must not credit account" (stView.clearedCashMinor == 0)
+
+  -- Cleanup so off-ledger automation runs are not polluted by this negative-path fixture.
+  _ <- submit alice do
+    exerciseCmd offerInstrCid Token.Withdraw
+  pure ()
+
+-- M2 hardening: cancellation race evidence.
+-- - Case A: cancel path returns Pending and is not allowlisted => CancelEscalated + no refund.
+-- - Case B: receiver accepts before cancel => cancel submit fails + no refund.
+testM2CancelRace : Script ()
+testM2CancelRace = script do
+  committee <- M1.getOrAllocateParty "PebbleCommittee"
+  alice <- M1.getOrAllocateParty "AliceM2CancelRace"
+  instrumentAdmin <- M1.getOrAllocateParty "WizardcatInstrumentAdmin"
+
+  runSuffix <- nextRunSuffixByInstrumentPrefix committee "WIZARDCAT-USD-DEV-M2-CANCEL-"
+
+  let instrumentId : Types.InstrumentId = "WIZARDCAT-USD-DEV-M2-CANCEL-" <> runSuffix
+  let accountId : Types.AccountId = "acc-m2-cancel-race-" <> runSuffix
+
+  tokenCfgCid <- submit committee do
+    createCmd Ref.TokenConfig with
+      committee
+      instrumentAdmin
+      instrumentId
+      registryUrl = "dev://wizardcat.xyz/pebble/mock-cip56-registry"
+      depositMode = Ref.OfferAcceptOnly
+      inboundRequiresAcceptance = True
+      decimals = 2
+      symbol = "WUSDDEV"
+      hardMaxInputsPerTransfer = 100
+      operationalMaxInputsPerTransfer = 80
+      targetUtxoCountMin = 20
+      targetUtxoCountMax = 50
+      dustThresholdMinor = 1
+      withdrawalFeeHeadroomMinor = 0
+      unexpectedFeeBufferMinor = 0
+      requiresDepositIdMetadata = True
+      allowedDepositPendingStatusClasses = [Token.statusClassInternalWorkflow]
+      allowedWithdrawalPendingStatusClasses = [Token.statusClassReceiverAcceptance, Token.statusClassInternalWorkflow]
+      -- Intentionally disallow all cancel-pending status classes to force CancelEscalated.
+      allowedCancelPendingStatusClasses = []
+      requiresOriginalInstructionCid = True
+      auditor = None
+
+  refCid0 <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stCid0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  aliceWalletCid <- submit alice do
+    createCmd Token.Wallet with
+      owner = alice
+      instrumentAdmin
+      instrumentId
+
+  committeeWalletCid <- submit committee do
+    createCmd Token.Wallet with
+      owner = committee
+      instrumentAdmin
+      instrumentId
+
+  faucetCid <- submit instrumentAdmin do
+    createCmd Token.Faucet with
+      instrumentAdmin
+      instrumentId
+
+  aliceClaimCid0 <- submit instrumentAdmin do
+    exerciseCmd faucetCid Token.Mint with
+      owner = alice
+      amountMinor = 100
+
+  aliceHoldingCid0 <- submit alice do
+    exerciseCmd aliceClaimCid0 Token.Claim
+
+  now <- getTime
+
+  -- Deposit and credit 10 (completed path) so withdrawals have cleared cash + committee inventory.
+  let depositId = "dep-m2-cancel-race-1"
+  let depositAmount : Types.AmountMinor = 10
+  let depositMd =
+        TM.fromList
+          [ (Treasury.metaAccountIdKey, accountId)
+          , (Treasury.metaDepositIdKey, depositId)
+          , ("wizardcat.xyz/mock.acceptOutcome", "Completed")
+          ]
+
+  offerInstrCid <- submit alice do
+    exerciseCmd aliceWalletCid Token.Offer with
+      receiver = committee
+      amountMinor = depositAmount
+      inputHoldingCids = [aliceHoldingCid0]
+      metadata = depositMd
+      reason = accountId
+      lockExpiresAt = now
+
+  depReqCid <- submit committee do
+    createCmd Treasury.DepositRequest with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      depositId
+      tokenConfigCid = tokenCfgCid
+      accountStateCid = stCid0
+      offerInstructionCid = offerInstrCid
+
+  depRes <- submit committee do
+    exerciseCmd depReqCid Treasury.AcceptOffer
+  stCid1 <- expectSome "expected credited AccountState on completed deposit" depRes.newAccountStateCid
+
+  stView1 <- submit committee do
+    exerciseCmd stCid1 Account.Fetch with requester = committee
+  assertMsg "expected initial deposit credit" (stView1.clearedCashMinor == depositAmount)
+
+  -- Suspend account for withdrawal eligibility.
+  refCid1 <- submit alice do
+    exerciseCmd refCid0 Account.RequestExit
+  refCid2 <- submit committee do
+    exerciseCmd refCid1 Account.FinalizeSuspension with epoch = 0
+
+  -- Case A: CancelEscalated (no refund).
+  let wdEscId = "wd-m2-cancel-escalated-1"
+  let wdEscAmount : Types.AmountMinor = 3
+  let wdEscMd =
+        TM.fromList
+          [ (Treasury.metaAccountIdKey, accountId)
+          , (Treasury.metaWithdrawalIdKey, wdEscId)
+          , ("wizardcat.xyz/mock.withdrawOutcome", "Pending")
+          ]
+
+  wdReqEscCid <- submit alice do
+    createCmd Treasury.WithdrawalRequest with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      withdrawalId = wdEscId
+      amountMinor = wdEscAmount
+
+  committeeInputsEsc <- holdingsByOrigin committee instrumentId offerInstrCid
+  wdProcEsc <- submit committee do
+    exerciseCmd wdReqEscCid Treasury.Process with
+      tokenConfigCid = tokenCfgCid
+      accountRefCid = refCid2
+      accountStateCid = stCid1
+      committeeWalletCid
+      inputHoldingCids = committeeInputsEsc
+      metadata = wdEscMd
+      reason = accountId
+      lockExpiresAt = now
+
+  (escPendingOpt, escRefundedStOpt, escReceiptOpt) <- submit committee do
+    exerciseCmd wdProcEsc.withdrawalPendingCid Treasury.CancelAndMaybeRefund with
+      accountStateCid = wdProcEsc.newAccountStateCid
+
+  escPendingCid <- expectSome "expected CancelEscalated pending contract" escPendingOpt
+  assertMsg "cancel-escalated must not refund state" (escRefundedStOpt == None)
+  assertMsg "cancel-escalated must not issue terminal receipt" (escReceiptOpt == None)
+
+  escPendingViewOpt <- queryContractId @Treasury.WithdrawalPending committee escPendingCid
+  escPendingView <- expectSome "expected active CancelEscalated pending contract" escPendingViewOpt
+  assertMsg "expected CancelEscalated state" (escPendingView.pendingState == Treasury.CancelEscalated)
+
+  stAfterEsc <- submit committee do
+    exerciseCmd wdProcEsc.newAccountStateCid Account.Fetch with requester = committee
+  assertMsg "cancel-escalated must not refund cash" (stAfterEsc.clearedCashMinor == depositAmount - wdEscAmount)
+
+  receiptsAfterEsc <- query @Treasury.WithdrawalReceipt committee
+  assertMsg
+    "cancel-escalated must not create terminal receipt"
+    (null (filter (\(_, r) -> r.withdrawalId == wdEscId) receiptsAfterEsc))
+
+  -- Case B: receiver accepts before cancel; cancel must fail and no refund is granted.
+  let wdRaceId = "wd-m2-cancel-race-2"
+  let wdRaceAmount : Types.AmountMinor = 2
+  let wdRaceMd =
+        TM.fromList
+          [ (Treasury.metaAccountIdKey, accountId)
+          , (Treasury.metaWithdrawalIdKey, wdRaceId)
+          ]
+
+  wdReqRaceCid <- submit alice do
+    createCmd Treasury.WithdrawalRequest with
+      committee
+      owner = alice
+      accountId
+      instrumentAdmin
+      instrumentId
+      withdrawalId = wdRaceId
+      amountMinor = wdRaceAmount
+
+  committeeInputsRace <- do
+    hs <- unlockedHoldingsOwnedBy committee instrumentId
+    pure (map fst hs)
+
+  wdProcRace <- submit committee do
+    exerciseCmd wdReqRaceCid Treasury.Process with
+      tokenConfigCid = tokenCfgCid
+      accountRefCid = refCid2
+      accountStateCid = wdProcEsc.newAccountStateCid
+      committeeWalletCid
+      inputHoldingCids = committeeInputsRace
+      metadata = wdRaceMd
+      reason = accountId
+      lockExpiresAt = now
+
+  terminalRaceInstrCid <- submit alice do
+    exerciseCmd wdProcRace.instructionCid Token.Accept
+
+  submitMustFail committee do
+    exerciseCmd wdProcRace.withdrawalPendingCid Treasury.CancelAndMaybeRefund with
+      accountStateCid = wdProcRace.newAccountStateCid
+
+  stAfterRaceCancel <- submit committee do
+    exerciseCmd wdProcRace.newAccountStateCid Account.Fetch with requester = committee
+  assertMsg "accept-before-cancel must not refund cash" (stAfterRaceCancel.clearedCashMinor == depositAmount - wdEscAmount - wdRaceAmount)
+
+  _wdRaceReceiptCid <- submit committee do
+    exerciseCmd wdProcRace.withdrawalPendingCid Treasury.FinalizeAccepted with
+      terminalInstructionCid = terminalRaceInstrCid
+
+  pure ()

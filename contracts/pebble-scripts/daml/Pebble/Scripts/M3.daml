@@ -1,0 +1,268 @@
+module Pebble.Scripts.M3 where
+
+import Daml.Script
+import DA.Text (isPrefixOf)
+
+import qualified Pebble.Account as Account
+import qualified Pebble.Clearing as Clearing
+import qualified Pebble.MarketLifecycle as Market
+import qualified Pebble.Types as Types
+
+partyMatchesHint : Text -> Party -> Bool
+partyMatchesHint hint p =
+  let partyText = show p
+      prefix = hint <> "::"
+   in prefix `isPrefixOf` partyText
+        || ("party " <> prefix) `isPrefixOf` partyText
+        || ("party '" <> prefix) `isPrefixOf` partyText
+        || ("party \"" <> prefix) `isPrefixOf` partyText
+        || ("'" <> prefix) `isPrefixOf` partyText
+        || ("\"" <> prefix) `isPrefixOf` partyText
+
+getOrAllocateParty : Text -> Script Party
+getOrAllocateParty hint = do
+  known <- listKnownParties
+  case filter (\pd -> partyMatchesHint hint pd.party) known of
+    (pd :: _) -> pure pd.party
+    [] -> allocatePartyByHint (PartyIdHint hint)
+
+data M3BootstrapSummary = M3BootstrapSummary
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    accountAId : Types.AccountId
+    accountBId : Types.AccountId
+    marketId : Types.MarketId
+  deriving (Eq, Show)
+
+data M3CatchupBootstrapSummary = M3CatchupBootstrapSummary
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    accountAId : Types.AccountId
+    accountBId : Types.AccountId
+    accountCId : Types.AccountId
+    marketId : Types.MarketId
+  deriving (Eq, Show)
+
+-- M3 bootstrap for off-ledger acceptance tests:
+-- - creates clearing head for an M3-specific instrument,
+-- - creates 2 active accounts and credits both with initial cash,
+-- - creates one open market for matching.
+--
+-- Run:
+--   dpm script --dar .daml/dist/pebble-scripts-0.1.0.dar --script-name Pebble.Scripts.M3:testM3Bootstrap
+
+testM3Bootstrap : Script M3BootstrapSummary
+testM3Bootstrap = script do
+  committee <- getOrAllocateParty "PebbleCommittee"
+  instrumentAdmin <- getOrAllocateParty "WizardcatInstrumentAdmin"
+  traderA <- getOrAllocateParty "M3TraderA"
+  traderB <- getOrAllocateParty "M3TraderB"
+
+  let instrumentId : Types.InstrumentId = "WIZARDCAT-USD-DEV-M3"
+  let marketId : Types.MarketId = "m3-market-1"
+  let accountAId : Types.AccountId = "acc-m3-1"
+  let accountBId : Types.AccountId = "acc-m3-2"
+  let engineVersion = Types.EngineVersion with value = "m3"
+
+  _headCid <- submit committee do
+    createCmd Clearing.ClearingHead with
+      committee
+      instrumentAdmin
+      instrumentId
+      nextEpoch = 1
+      prevBatchHash = "GENESIS"
+      engineVersion
+      lastBatchAnchor = None
+
+  _marketCid <- submit committee do
+    createCmd Market.MarketLifecycle with
+      committee
+      creator = committee
+      marketId
+      question = "M3 bootstrap market"
+      outcomes = ["YES", "NO"]
+      status = Market.Open
+      resolvedOutcome = None
+
+  _refA <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = traderA
+      accountId = accountAId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stA0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = traderA
+      accountId = accountAId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  _stA1 <- submit committee do
+    exerciseCmd stA0 Account.Credit with amountMinor = 100000
+
+  _refB <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = traderB
+      accountId = accountBId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stB0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = traderB
+      accountId = accountBId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  _stB1 <- submit committee do
+    exerciseCmd stB0 Account.Credit with amountMinor = 100000
+
+  pure M3BootstrapSummary with
+    committee
+    instrumentAdmin
+    instrumentId
+    accountAId
+    accountBId
+    marketId
+
+-- M3 catch-up bootstrap for acceptance tests:
+-- - creates clearing head for a catch-up specific instrument,
+-- - creates 3 active accounts (A/B/C) with initial cash,
+-- - creates one open market for matching.
+--
+-- Run:
+--   dpm script --dar .daml/dist/pebble-scripts-0.1.0.dar --script-name Pebble.Scripts.M3:testM3CatchupBootstrap
+testM3CatchupBootstrap : Script M3CatchupBootstrapSummary
+testM3CatchupBootstrap = script do
+  committee <- getOrAllocateParty "PebbleCommittee"
+  instrumentAdmin <- getOrAllocateParty "WizardcatInstrumentAdmin"
+  traderA <- getOrAllocateParty "M3CatchupTraderA"
+  traderB <- getOrAllocateParty "M3CatchupTraderB"
+  traderC <- getOrAllocateParty "M3CatchupTraderC"
+
+  let instrumentId : Types.InstrumentId = "WIZARDCAT-USD-DEV-M3-CATCHUP"
+  let marketId : Types.MarketId = "m3-catchup-market-1"
+  let accountAId : Types.AccountId = "acc-m3-catch-a"
+  let accountBId : Types.AccountId = "acc-m3-catch-b"
+  let accountCId : Types.AccountId = "acc-m3-catch-c"
+  let engineVersion = Types.EngineVersion with value = "m3"
+
+  _headCid <- submit committee do
+    createCmd Clearing.ClearingHead with
+      committee
+      instrumentAdmin
+      instrumentId
+      nextEpoch = 1
+      prevBatchHash = "GENESIS"
+      engineVersion
+      lastBatchAnchor = None
+
+  _marketCid <- submit committee do
+    createCmd Market.MarketLifecycle with
+      committee
+      creator = committee
+      marketId
+      question = "M3 catch-up bootstrap market"
+      outcomes = ["YES", "NO"]
+      status = Market.Open
+      resolvedOutcome = None
+
+  _refA <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = traderA
+      accountId = accountAId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stA0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = traderA
+      accountId = accountAId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  _stA1 <- submit committee do
+    exerciseCmd stA0 Account.Credit with amountMinor = 100000
+
+  _refB <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = traderB
+      accountId = accountBId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stB0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = traderB
+      accountId = accountBId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  _stB1 <- submit committee do
+    exerciseCmd stB0 Account.Credit with amountMinor = 100000
+
+  _refC <- submit committee do
+    createCmd Account.AccountRef with
+      committee
+      owner = traderC
+      accountId = accountCId
+      instrumentAdmin
+      instrumentId
+      status = Account.Active
+      finalizedEpoch = None
+
+  stC0 <- submit committee do
+    createCmd Account.AccountState with
+      committee
+      owner = traderC
+      accountId = accountCId
+      instrumentAdmin
+      instrumentId
+      clearedCashMinor = 0
+      lastAppliedEpoch = 0
+      lastAppliedBatchAnchor = None
+
+  _stC1 <- submit committee do
+    exerciseCmd stC0 Account.Credit with amountMinor = 100000
+
+  pure M3CatchupBootstrapSummary with
+    committee
+    instrumentAdmin
+    instrumentId
+    accountAId
+    accountBId
+    accountCId
+    marketId

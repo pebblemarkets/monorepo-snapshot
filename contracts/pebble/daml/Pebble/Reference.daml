@@ -1,0 +1,201 @@
+module Pebble.Reference where
+
+import Pebble.Types as Types
+
+-- Reference contracts are committee-signed and (optionally) auditor-observed.
+-- They deliberately have minimal stakeholders and support explicit disclosure
+-- verification via `Fetch` choices.
+
+data DepositMode = OfferAcceptOnly | DirectOnly | OfferOrDirect
+  deriving (Eq, Show)
+
+data WithdrawalFeePolicy = TreasurySubsidized | UserPays
+  deriving (Eq, Show)
+
+data DepositFeePolicy = CreditObservedReceived
+  deriving (Eq, Show)
+
+data OracleMode = CommitteeResolution | SignedOracle
+  deriving (Eq, Show)
+
+data TokenConfigView = TokenConfigView
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    registryUrl : Text
+    depositMode : DepositMode
+    inboundRequiresAcceptance : Bool
+    decimals : Int
+    symbol : Text
+    hardMaxInputsPerTransfer : Int
+    operationalMaxInputsPerTransfer : Int
+    -- Target unlocked UTXO count range (inclusive). Used by treasury consolidation.
+    targetUtxoCountMin : Int
+    targetUtxoCountMax : Int
+    dustThresholdMinor : Types.AmountMinor
+    withdrawalFeeHeadroomMinor : Types.AmountMinor
+    unexpectedFeeBufferMinor : Types.AmountMinor
+    requiresDepositIdMetadata : Bool
+    allowedDepositPendingStatusClasses : [Text]
+    allowedWithdrawalPendingStatusClasses : [Text]
+    allowedCancelPendingStatusClasses : [Text]
+    requiresOriginalInstructionCid : Bool
+    auditor : Optional Party
+  deriving (Eq, Show)
+
+template TokenConfig
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    registryUrl : Text
+    depositMode : DepositMode
+    inboundRequiresAcceptance : Bool
+    decimals : Int
+    symbol : Text
+    hardMaxInputsPerTransfer : Int
+    operationalMaxInputsPerTransfer : Int
+    targetUtxoCountMin : Int
+    targetUtxoCountMax : Int
+    dustThresholdMinor : Types.AmountMinor
+    withdrawalFeeHeadroomMinor : Types.AmountMinor
+    unexpectedFeeBufferMinor : Types.AmountMinor
+    requiresDepositIdMetadata : Bool
+    allowedDepositPendingStatusClasses : [Text]
+    allowedWithdrawalPendingStatusClasses : [Text]
+    allowedCancelPendingStatusClasses : [Text]
+    requiresOriginalInstructionCid : Bool
+    auditor : Optional Party
+  where
+    signatory committee
+    observer
+      case auditor of
+        None -> []
+        Some a -> [a]
+
+    ensure
+      Types.nonEmptyText instrumentId
+        && Types.nonEmptyText registryUrl
+        && Types.nonEmptyText symbol
+        && decimals >= 0
+        && decimals <= 10
+        && hardMaxInputsPerTransfer > 0
+        && operationalMaxInputsPerTransfer > 0
+        && operationalMaxInputsPerTransfer <= hardMaxInputsPerTransfer
+        && targetUtxoCountMin >= 0
+        && targetUtxoCountMax >= targetUtxoCountMin
+        && dustThresholdMinor >= 0
+        && withdrawalFeeHeadroomMinor >= 0
+        && unexpectedFeeBufferMinor >= 0
+        && Types.allUnique allowedDepositPendingStatusClasses
+        && Types.allUnique allowedWithdrawalPendingStatusClasses
+        && Types.allUnique allowedCancelPendingStatusClasses
+
+    choice FetchTokenConfig : TokenConfigView
+      with
+        requester : Party
+      controller requester
+      do
+        pure TokenConfigView
+          with
+            committee
+            instrumentAdmin
+            instrumentId
+            registryUrl
+            depositMode
+            inboundRequiresAcceptance
+            decimals
+            symbol
+            hardMaxInputsPerTransfer
+            operationalMaxInputsPerTransfer
+            targetUtxoCountMin
+            targetUtxoCountMax
+            dustThresholdMinor
+            withdrawalFeeHeadroomMinor
+            unexpectedFeeBufferMinor
+            requiresDepositIdMetadata
+            allowedDepositPendingStatusClasses
+            allowedWithdrawalPendingStatusClasses
+            allowedCancelPendingStatusClasses
+            requiresOriginalInstructionCid
+            auditor
+
+data FeeScheduleView = FeeScheduleView
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    depositPolicy : DepositFeePolicy
+    withdrawalPolicy : WithdrawalFeePolicy
+    auditor : Optional Party
+  deriving (Eq, Show)
+
+template FeeSchedule
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    depositPolicy : DepositFeePolicy
+    withdrawalPolicy : WithdrawalFeePolicy
+    auditor : Optional Party
+  where
+    signatory committee
+    observer
+      case auditor of
+        None -> []
+        Some a -> [a]
+
+    ensure Types.nonEmptyText instrumentId
+
+    choice FetchFeeSchedule : FeeScheduleView
+      with
+        requester : Party
+      controller requester
+      do
+        pure FeeScheduleView
+          with
+            committee
+            instrumentAdmin
+            instrumentId
+            depositPolicy
+            withdrawalPolicy
+            auditor
+
+data OracleConfigView = OracleConfigView
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    mode : OracleMode
+    auditor : Optional Party
+  deriving (Eq, Show)
+
+template OracleConfig
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    mode : OracleMode
+    auditor : Optional Party
+  where
+    signatory committee
+    observer
+      case auditor of
+        None -> []
+        Some a -> [a]
+
+    ensure Types.nonEmptyText instrumentId
+
+    choice FetchOracleConfig : OracleConfigView
+      with
+        requester : Party
+      controller requester
+      do
+        pure OracleConfigView
+          with
+            committee
+            instrumentAdmin
+            instrumentId
+            mode
+            auditor

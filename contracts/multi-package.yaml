@@ -1,0 +1,4 @@
+packages:
+  - ./wizardcat-token-standard
+  - ./pebble
+  - ./pebble-scripts

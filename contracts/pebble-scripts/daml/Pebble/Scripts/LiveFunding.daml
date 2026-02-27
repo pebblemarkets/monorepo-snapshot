@@ -1,0 +1,98 @@
+module Pebble.Scripts.LiveFunding where
+
+import Daml.Script
+import DA.Assert (assertMsg)
+import qualified DA.TextMap as TM
+
+import qualified Pebble.Scripts.M1 as M1
+import qualified Pebble.Treasury as Treasury
+import qualified Pebble.Types as Types
+import qualified Wizardcat.Token.Standard as Token
+
+forEachS_ : [a] -> (a -> Script ()) -> Script ()
+forEachS_ xs f =
+  case xs of
+    [] -> pure ()
+    x :: rest -> do
+      f x
+      forEachS_ rest f
+
+data LiveFundingUser = LiveFundingUser
+  with
+    ownerParty : Party
+    accountId : Types.AccountId
+    depositId : Text
+    amountMinor : Types.AmountMinor
+  deriving (Eq, Show)
+
+data LiveFundingInput = LiveFundingInput
+  with
+    instrumentId : Types.InstrumentId
+    users : [LiveFundingUser]
+  deriving (Eq, Show)
+
+ensureWallet : Party -> Party -> Types.InstrumentId -> Script (ContractId Token.Wallet)
+ensureWallet ownerParty instrumentAdmin instrumentId = do
+  wallets <- query @Token.Wallet ownerParty
+  case filter (\(_, wallet) -> wallet.instrumentAdmin == instrumentAdmin && wallet.instrumentId == instrumentId) wallets of
+    (cid, _) :: _ -> pure cid
+    [] -> submit ownerParty do
+      createCmd Token.Wallet with
+        owner = ownerParty
+        instrumentAdmin
+        instrumentId
+
+fundLiveDemoAccounts : LiveFundingInput -> Script ()
+fundLiveDemoAccounts input = script do
+  committee <- M1.getOrAllocateParty "PebbleCommittee"
+  instrumentAdmin <- M1.getOrAllocateParty "WizardcatInstrumentAdmin"
+
+  let instrumentId = input.instrumentId
+  if instrumentId == "" then
+    abort "instrumentId must be non-empty"
+  else pure ()
+
+  now <- getTime
+
+  forEachS_ input.users (\userInput -> do
+    assertMsg "amountMinor must be > 0" (userInput.amountMinor > 0)
+    if userInput.accountId == "" then
+      abort "accountId must be non-empty"
+    else pure ()
+    if userInput.depositId == "" then
+      abort "depositId must be non-empty"
+    else pure ()
+
+    walletCid <- ensureWallet userInput.ownerParty instrumentAdmin instrumentId
+
+    faucetCid <- submit instrumentAdmin do
+      createCmd Token.Faucet with
+        instrumentAdmin
+        instrumentId
+
+    claimCid <- submit instrumentAdmin do
+      exerciseCmd faucetCid Token.Mint with
+        owner = userInput.ownerParty
+        amountMinor = userInput.amountMinor
+
+    holdingCid <- submit userInput.ownerParty do
+      exerciseCmd claimCid Token.Claim
+
+    let metadata =
+          TM.fromList
+            [ (Treasury.metaAccountIdKey, userInput.accountId)
+            , (Treasury.metaDepositIdKey, userInput.depositId)
+            ]
+
+    _offerCid <- submit userInput.ownerParty do
+      exerciseCmd walletCid Token.Offer with
+        receiver = committee
+        amountMinor = userInput.amountMinor
+        inputHoldingCids = [holdingCid]
+        metadata
+        reason = userInput.accountId
+        lockExpiresAt = now
+
+    pure ())
+
+  pure ()

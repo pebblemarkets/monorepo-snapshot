@@ -1,0 +1,98 @@
+module Pebble.Scripts.LiveBootstrap where
+
+import Daml.Script
+
+import qualified Pebble.Clearing as Clearing
+import qualified Pebble.Reference as Ref
+import qualified Pebble.Types as Types
+import qualified Pebble.Scripts.M1 as M1
+import qualified Wizardcat.Token.Standard as Token
+
+data LiveBootstrapInput = LiveBootstrapInput
+  with
+    instrumentId : Types.InstrumentId
+  deriving (Eq, Show)
+
+ensureLiveInstrumentBootstrap : LiveBootstrapInput -> Script ()
+ensureLiveInstrumentBootstrap input = script do
+  committee <- M1.getOrAllocateParty "PebbleCommittee"
+  instrumentAdmin <- M1.getOrAllocateParty "WizardcatInstrumentAdmin"
+  let engineVersion = Types.EngineVersion with value = "m3"
+
+  let instrumentId = input.instrumentId
+  if instrumentId == "" then
+    abort "instrumentId must be non-empty"
+  else pure ()
+
+  tokenCfgs <- query @Ref.TokenConfig committee
+  case filter (\(_, cfg) -> cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId) tokenCfgs of
+    [] -> do
+      _ <- submit committee do
+        createCmd Ref.TokenConfig with
+          committee
+          instrumentAdmin
+          instrumentId
+          registryUrl = "dev://wizardcat.xyz/pebble/mock-cip56-registry"
+          depositMode = Ref.OfferAcceptOnly
+          inboundRequiresAcceptance = True
+          decimals = 2
+          symbol = "WUSDDEV"
+          hardMaxInputsPerTransfer = 100
+          operationalMaxInputsPerTransfer = 80
+          targetUtxoCountMin = 20
+          targetUtxoCountMax = 200
+          dustThresholdMinor = 1
+          withdrawalFeeHeadroomMinor = 0
+          unexpectedFeeBufferMinor = 0
+          requiresDepositIdMetadata = True
+          allowedDepositPendingStatusClasses = [Token.statusClassInternalWorkflow]
+          allowedWithdrawalPendingStatusClasses = [Token.statusClassReceiverAcceptance, Token.statusClassInternalWorkflow]
+          allowedCancelPendingStatusClasses = [Token.statusClassInternalWorkflow]
+          requiresOriginalInstructionCid = True
+          auditor = None
+      pure ()
+    _ -> pure ()
+
+  feeCfgs <- query @Ref.FeeSchedule committee
+  case filter (\(_, cfg) -> cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId) feeCfgs of
+    [] -> do
+      _ <- submit committee do
+        createCmd Ref.FeeSchedule with
+          committee
+          instrumentAdmin
+          instrumentId
+          depositPolicy = Ref.CreditObservedReceived
+          withdrawalPolicy = Ref.TreasurySubsidized
+          auditor = None
+      pure ()
+    _ -> pure ()
+
+  oracleCfgs <- query @Ref.OracleConfig committee
+  case filter (\(_, cfg) -> cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId) oracleCfgs of
+    [] -> do
+      _ <- submit committee do
+        createCmd Ref.OracleConfig with
+          committee
+          instrumentAdmin
+          instrumentId
+          mode = Ref.CommitteeResolution
+          auditor = None
+      pure ()
+    _ -> pure ()
+
+  heads <- query @Clearing.ClearingHead committee
+  case filter (\(_, h) -> h.instrumentAdmin == instrumentAdmin && h.instrumentId == instrumentId) heads of
+    [] -> do
+      _ <- submit committee do
+        createCmd Clearing.ClearingHead with
+          committee
+          instrumentAdmin
+          instrumentId
+          nextEpoch = 1
+          prevBatchHash = "GENESIS"
+          engineVersion
+          lastBatchAnchor = None
+      pure ()
+    _ -> pure ()
+
+  pure ()

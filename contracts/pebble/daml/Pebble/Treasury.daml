@@ -1,0 +1,781 @@
+module Pebble.Treasury where
+
+import DA.Assert (assertMsg)
+import DA.Optional (fromSome)
+import DA.TextMap (TextMap)
+import qualified DA.TextMap as TM
+
+import Pebble.Account as Account
+import Pebble.Reference as Ref
+import Pebble.Types as Types
+import qualified Wizardcat.Token.Standard as Token
+
+-- Metadata conventions (wizardcat.xyz)
+metaAccountIdKey : Text
+metaAccountIdKey = "wizardcat.xyz/pebble.accountId"
+
+metaDepositIdKey : Text
+metaDepositIdKey = "wizardcat.xyz/pebble.depositId"
+
+metaWithdrawalIdKey : Text
+metaWithdrawalIdKey = "wizardcat.xyz/pebble.withdrawalId"
+
+metaFlowKey : Text
+metaFlowKey = "wizardcat.xyz/pebble.flow"
+
+metaFlowWithdrawal : Text
+metaFlowWithdrawal = "Withdrawal"
+
+requireMeta : Text -> TextMap Text -> Update Text
+requireMeta key metadata =
+  case TM.lookup key metadata of
+    Some v -> pure v
+    None -> do
+      assertMsg ("missing required metadata key: " <> key) False
+      pure "" -- unreachable
+
+assertStatusClassAllowed : Text -> [Text] -> Update ()
+assertStatusClassAllowed statusClass allowed =
+  assertMsg
+    ("statusClass not allowed: " <> statusClass)
+    (statusClass `elem` allowed)
+
+fetchAll : [ContractId a] -> (ContractId a -> Update a) -> Update [a]
+fetchAll cids fetchOne =
+  case cids of
+    [] -> pure []
+    cid :: rest -> do
+      x <- fetchOne cid
+      xs <- fetchAll rest fetchOne
+      pure (x :: xs)
+
+forEach_ : [a] -> (a -> Update ()) -> Update ()
+forEach_ xs f =
+  case xs of
+    [] -> pure ()
+    x :: rest -> do
+      f x
+      forEach_ rest f
+
+-- --------------------
+-- Deposits
+-- --------------------
+
+data DepositAcceptResult = DepositAcceptResult
+  with
+    acceptedInstructionCid : ContractId Token.TransferInstruction
+    depositPendingCid : Optional (ContractId DepositPending)
+    depositReceiptCid : Optional (ContractId DepositReceipt)
+    newAccountStateCid : Optional (ContractId Account.AccountState)
+  deriving (Eq, Show)
+
+template DepositRequest
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    depositId : Text
+    tokenConfigCid : ContractId Ref.TokenConfig
+    accountStateCid : ContractId Account.AccountState
+    offerInstructionCid : ContractId Token.TransferInstruction
+  where
+    signatory committee
+    observer owner
+
+    ensure
+      Types.nonEmptyText accountId
+        && Types.nonEmptyText instrumentId
+        && Types.nonEmptyText depositId
+
+    -- Accept a user-created token offer and atomically branch into:
+    -- - Completed: credit + receipt
+    -- - Pending: DepositPending (no credit)
+    -- - Failed: no credit
+    choice AcceptOffer : DepositAcceptResult
+      controller committee
+      do
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+        assertMsg "depositMode must be OfferAcceptOnly" (cfg.depositMode == Ref.OfferAcceptOnly)
+        assertMsg "inboundRequiresAcceptance must be True" cfg.inboundRequiresAcceptance
+
+        offerView <- exercise offerInstructionCid Token.View with requester = committee
+        assertMsg "offer output must be Pending" (offerView.output == Token.Pending)
+        assertMsg "offer must be receiver-acceptance pending" (offerView.statusClass == Some Token.statusClassReceiverAcceptance)
+
+        assertMsg "offer sender mismatch" (offerView.sender == owner)
+        assertMsg "offer receiver mismatch" (offerView.receiver == committee)
+        assertMsg "offer instrument mismatch" (offerView.instrumentAdmin == instrumentAdmin && offerView.instrumentId == instrumentId)
+        -- M2 minimum-deposit policy: treat TokenConfig.dustThresholdMinor as the minimum
+        -- accepted inbound deposit amount for this instrument.
+        assertMsg "deposit amount below minimum threshold" (offerView.amountMinor >= cfg.dustThresholdMinor)
+
+        acctMeta <- requireMeta metaAccountIdKey offerView.metadata
+        assertMsg "metadata accountId mismatch" (acctMeta == accountId)
+
+        if cfg.requiresDepositIdMetadata then do
+          depMeta <- requireMeta metaDepositIdKey offerView.metadata
+          assertMsg "metadata depositId mismatch" (depMeta == depositId)
+        else pure ()
+
+        -- Exercise token acceptance (CIP-56 style) and branch on the resulting instruction output.
+        nextInstructionCid <- exercise offerInstructionCid Token.Accept
+        nextView <- exercise nextInstructionCid Token.View with requester = committee
+
+        case nextView.originalInstructionCid of
+          Some root -> assertMsg "lineage root mismatch" (root == offerInstructionCid)
+          None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+        case nextView.output of
+          Token.Completed -> do
+            st <- fetch accountStateCid
+            assertMsg "AccountState.accountId mismatch" (st.accountId == accountId)
+            assertMsg "AccountState.owner mismatch" (st.owner == owner)
+            assertMsg "AccountState.instrument mismatch" (st.instrumentAdmin == instrumentAdmin && st.instrumentId == instrumentId)
+
+            stCid1 <- exercise accountStateCid Account.Credit with amountMinor = nextView.amountMinor
+
+            receiptCid <- create DepositReceipt with
+              committee
+              owner
+              accountId
+              instrumentAdmin
+              instrumentId
+              depositId
+              lineageRootInstructionCid = offerInstructionCid
+              terminalInstructionCid = nextInstructionCid
+              creditedMinor = nextView.amountMinor
+              receiverHoldingCids = []
+              metadata = nextView.metadata
+              reason = nextView.reason
+
+            pure DepositAcceptResult with
+              acceptedInstructionCid = nextInstructionCid
+              depositPendingCid = None
+              depositReceiptCid = Some receiptCid
+              newAccountStateCid = Some stCid1
+          Token.Pending -> do
+            let sc = fromSome nextView.statusClass
+            assertStatusClassAllowed sc cfg.allowedDepositPendingStatusClasses
+
+            pendingCid <- create DepositPending with
+              committee
+              owner
+              accountId
+              instrumentAdmin
+              instrumentId
+              depositId
+              tokenConfigCid
+              lineageRootInstructionCid = offerInstructionCid
+              currentInstructionCid = nextInstructionCid
+              stepSeq = 0
+              expectedAmountMinor = nextView.amountMinor
+              metadata = nextView.metadata
+              reason = nextView.reason
+
+            pure DepositAcceptResult with
+              acceptedInstructionCid = nextInstructionCid
+              depositPendingCid = Some pendingCid
+              depositReceiptCid = None
+              newAccountStateCid = None
+          Token.Failed -> pure DepositAcceptResult with
+            acceptedInstructionCid = nextInstructionCid
+            depositPendingCid = None
+            depositReceiptCid = None
+            newAccountStateCid = None
+
+template DepositPending
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    depositId : Text
+    tokenConfigCid : ContractId Ref.TokenConfig
+    lineageRootInstructionCid : ContractId Token.TransferInstruction
+    currentInstructionCid : ContractId Token.TransferInstruction
+    stepSeq : Int
+    expectedAmountMinor : Types.AmountMinor
+    metadata : TextMap Text
+    reason : Text
+  where
+    signatory committee
+    observer owner
+
+    ensure
+      Types.nonEmptyText accountId
+        && Types.nonEmptyText instrumentId
+        && Types.nonEmptyText depositId
+        && stepSeq >= 0
+        && expectedAmountMinor > 0
+
+    choice AdvanceDepositPending : ContractId DepositPending
+      with
+        nextInstructionCid : ContractId Token.TransferInstruction
+      controller committee
+      do
+        assertMsg "nextInstructionCid must differ from currentInstructionCid" (nextInstructionCid /= currentInstructionCid)
+
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+
+        nextView <- exercise nextInstructionCid Token.View with requester = committee
+        assertMsg "next instruction must be Pending" (nextView.output == Token.Pending)
+
+        let sc = fromSome nextView.statusClass
+        assertStatusClassAllowed sc cfg.allowedDepositPendingStatusClasses
+
+        case nextView.originalInstructionCid of
+          Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+          None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+        assertMsg "sender mismatch" (nextView.sender == owner)
+        assertMsg "receiver mismatch" (nextView.receiver == committee)
+        assertMsg "instrument mismatch" (nextView.instrumentAdmin == instrumentAdmin && nextView.instrumentId == instrumentId)
+        assertMsg "amountMinor mismatch" (nextView.amountMinor == expectedAmountMinor)
+        assertMsg "metadata fingerprint mismatch" (nextView.metadata == metadata)
+        assertMsg "reason fingerprint mismatch" (nextView.reason == reason)
+
+        acctMeta <- requireMeta metaAccountIdKey nextView.metadata
+        assertMsg "metadata accountId mismatch" (acctMeta == accountId)
+
+        if cfg.requiresDepositIdMetadata then do
+          depMeta <- requireMeta metaDepositIdKey nextView.metadata
+          assertMsg "metadata depositId mismatch" (depMeta == depositId)
+        else pure ()
+
+        create this with
+          currentInstructionCid = nextInstructionCid
+          stepSeq = stepSeq + 1
+
+    choice FinalizeCompleted : (ContractId Account.AccountState, ContractId DepositReceipt)
+      with
+        accountStateCid : ContractId Account.AccountState
+        terminalInstructionCid : ContractId Token.TransferInstruction
+        receiverHoldingCids : [ContractId Token.Holding]
+      controller committee
+      do
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+
+        view <- exercise terminalInstructionCid Token.View with requester = committee
+        assertMsg "instruction is not Completed" (view.output == Token.Completed)
+
+        case view.originalInstructionCid of
+          Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+          None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+        assertMsg "sender mismatch" (view.sender == owner)
+        assertMsg "receiver mismatch" (view.receiver == committee)
+        assertMsg "instrument mismatch" (view.instrumentAdmin == instrumentAdmin && view.instrumentId == instrumentId)
+        assertMsg "amountMinor mismatch" (view.amountMinor == expectedAmountMinor)
+        assertMsg "metadata fingerprint mismatch" (view.metadata == metadata)
+        assertMsg "reason fingerprint mismatch" (view.reason == reason)
+
+        st <- fetch accountStateCid
+        assertMsg "AccountState.accountId mismatch" (st.accountId == accountId)
+        assertMsg "AccountState.owner mismatch" (st.owner == owner)
+        assertMsg "AccountState.instrument mismatch" (st.instrumentAdmin == instrumentAdmin && st.instrumentId == instrumentId)
+
+        acctMeta <- requireMeta metaAccountIdKey view.metadata
+        assertMsg "metadata accountId mismatch" (acctMeta == accountId)
+
+        if cfg.requiresDepositIdMetadata then do
+          depMeta <- requireMeta metaDepositIdKey view.metadata
+          assertMsg "metadata depositId mismatch" (depMeta == depositId)
+        else pure ()
+
+        assertMsg "receiverHoldingCids must be non-empty" (not (null receiverHoldingCids))
+        holdings <- fetchAll receiverHoldingCids fetch
+
+        forEach_ holdings (\h -> do
+          assertMsg "holding owner mismatch" (h.owner == committee)
+          assertMsg "holding instrument mismatch" (h.instrumentAdmin == instrumentAdmin && h.instrumentId == instrumentId)
+          assertMsg "holding is locked" (h.lock == None)
+          assertMsg "holding origin mismatch" (h.originInstructionCid == Some lineageRootInstructionCid)
+          )
+
+        let creditedMinor = foldl (+) 0 (map (\h -> h.amountMinor) holdings)
+        assertMsg "creditedMinor must be > 0" (creditedMinor > 0)
+
+        stCid1 <- exercise accountStateCid Account.Credit with amountMinor = creditedMinor
+
+        receiptCid <- create DepositReceipt with
+          committee
+          owner
+          accountId
+          instrumentAdmin
+          instrumentId
+          depositId
+          lineageRootInstructionCid
+          terminalInstructionCid
+          creditedMinor
+          receiverHoldingCids
+          metadata
+          reason
+
+        pure (stCid1, receiptCid)
+
+    choice FinalizeFailed : ()
+      with
+        terminalInstructionCid : ContractId Token.TransferInstruction
+      controller committee
+      do
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+
+        view <- exercise terminalInstructionCid Token.View with requester = committee
+        assertMsg "instruction is not Failed" (view.output == Token.Failed)
+
+        case view.originalInstructionCid of
+          Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+          None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+        assertMsg "sender mismatch" (view.sender == owner)
+        assertMsg "receiver mismatch" (view.receiver == committee)
+        assertMsg "instrument mismatch" (view.instrumentAdmin == instrumentAdmin && view.instrumentId == instrumentId)
+        assertMsg "amountMinor mismatch" (view.amountMinor == expectedAmountMinor)
+        assertMsg "metadata fingerprint mismatch" (view.metadata == metadata)
+        assertMsg "reason fingerprint mismatch" (view.reason == reason)
+
+        acctMeta <- requireMeta metaAccountIdKey view.metadata
+        assertMsg "metadata accountId mismatch" (acctMeta == accountId)
+
+        if cfg.requiresDepositIdMetadata then do
+          depMeta <- requireMeta metaDepositIdKey view.metadata
+          assertMsg "metadata depositId mismatch" (depMeta == depositId)
+        else pure ()
+        pure ()
+
+template DepositReceipt
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    depositId : Text
+    lineageRootInstructionCid : ContractId Token.TransferInstruction
+    terminalInstructionCid : ContractId Token.TransferInstruction
+    creditedMinor : Types.AmountMinor
+    receiverHoldingCids : [ContractId Token.Holding]
+    metadata : TextMap Text
+    reason : Text
+  where
+    signatory committee
+    observer owner
+
+    ensure
+      Types.nonEmptyText accountId
+        && Types.nonEmptyText instrumentId
+        && Types.nonEmptyText depositId
+        && creditedMinor > 0
+
+-- --------------------
+-- Withdrawals
+-- --------------------
+
+data WithdrawalPendingState = OfferPending | CancelPending | CancelEscalated
+  deriving (Eq, Show)
+
+data WithdrawalProcessResult = WithdrawalProcessResult
+  with
+    withdrawalPendingCid : ContractId WithdrawalPending
+    newAccountStateCid : ContractId Account.AccountState
+    instructionCid : ContractId Token.TransferInstruction
+  deriving (Eq, Show)
+
+template WithdrawalRequest
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    withdrawalId : Text
+    amountMinor : Types.AmountMinor
+  where
+    signatory owner
+    observer committee
+
+    ensure
+      Types.nonEmptyText accountId
+        && Types.nonEmptyText instrumentId
+        && Types.nonEmptyText withdrawalId
+        && amountMinor > 0
+
+    choice Process : WithdrawalProcessResult
+      with
+        tokenConfigCid : ContractId Ref.TokenConfig
+        accountRefCid : ContractId Account.AccountRef
+        accountStateCid : ContractId Account.AccountState
+        committeeWalletCid : ContractId Token.Wallet
+        inputHoldingCids : [ContractId Token.Holding]
+        metadata : TextMap Text
+        reason : Text
+        lockExpiresAt : Time
+      controller committee
+      do
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+        assertMsg "inputHoldingCids must be non-empty" (not (null inputHoldingCids))
+        assertMsg "too many inputs for transfer" (length inputHoldingCids <= cfg.operationalMaxInputsPerTransfer)
+
+        ref <- fetch accountRefCid
+        assertMsg "AccountRef mismatch" (ref.accountId == accountId && ref.owner == owner)
+        assertMsg "AccountRef instrument mismatch" (ref.instrumentAdmin == instrumentAdmin && ref.instrumentId == instrumentId)
+        let withdrawalStatusAllowed =
+              case ref.status of
+                Account.Active -> True
+                Account.Suspended -> True
+                Account.Suspending -> False
+                Account.Closed -> False
+        assertMsg "account status not allowed for withdrawal" withdrawalStatusAllowed
+
+        st <- fetch accountStateCid
+        assertMsg "AccountState mismatch" (st.accountId == accountId && st.owner == owner)
+        assertMsg "AccountState instrument mismatch" (st.instrumentAdmin == instrumentAdmin && st.instrumentId == instrumentId)
+        assertMsg "insufficient cleared cash" (st.clearedCashMinor >= amountMinor)
+
+        case ref.status of
+          Account.Suspended ->
+            case ref.finalizedEpoch of
+              None -> assertMsg "AccountRef finalizedEpoch missing" False
+              Some e -> assertMsg "AccountState not caught up to finalized epoch" (st.lastAppliedEpoch >= e)
+          _ -> pure ()
+
+        acctMeta <- requireMeta metaAccountIdKey metadata
+        assertMsg "metadata accountId mismatch" (acctMeta == accountId)
+
+        wdMeta <- requireMeta metaWithdrawalIdKey metadata
+        assertMsg "metadata withdrawalId mismatch" (wdMeta == withdrawalId)
+
+        flowMeta <- requireMeta metaFlowKey metadata
+        assertMsg "metadata flow mismatch" (flowMeta == metaFlowWithdrawal)
+
+        instrCid <- exercise committeeWalletCid Token.Offer with
+          receiver = owner
+          amountMinor
+          inputHoldingCids
+          metadata
+          reason
+          lockExpiresAt
+
+        instrView <- exercise instrCid Token.View with requester = committee
+        assertMsg "instruction output must be Pending" (instrView.output == Token.Pending)
+        assertMsg "sender mismatch" (instrView.sender == committee)
+        assertMsg "receiver mismatch" (instrView.receiver == owner)
+        assertMsg "instrument mismatch" (instrView.instrumentAdmin == instrumentAdmin && instrView.instrumentId == instrumentId)
+        assertMsg "amountMinor mismatch" (instrView.amountMinor == amountMinor)
+        assertMsg "metadata fingerprint mismatch" (instrView.metadata == metadata)
+        assertMsg "reason fingerprint mismatch" (instrView.reason == reason)
+        let sc = fromSome instrView.statusClass
+        assertStatusClassAllowed sc cfg.allowedWithdrawalPendingStatusClasses
+
+        newStCid <- exercise accountStateCid Account.Debit with amountMinor = amountMinor
+
+        pendingCid <- create WithdrawalPending with
+          committee
+          owner
+          accountId
+          instrumentAdmin
+          instrumentId
+          withdrawalId
+          amountMinor
+          tokenConfigCid
+          lineageRootInstructionCid = instrCid
+          currentInstructionCid = instrCid
+          stepSeq = 0
+          pendingState = OfferPending
+          pendingActions = instrView.pendingActions
+          metadata
+          reason
+
+        pure WithdrawalProcessResult with
+          withdrawalPendingCid = pendingCid
+          newAccountStateCid = newStCid
+          instructionCid = instrCid
+
+template WithdrawalPending
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    withdrawalId : Text
+    amountMinor : Types.AmountMinor
+    tokenConfigCid : ContractId Ref.TokenConfig
+    lineageRootInstructionCid : ContractId Token.TransferInstruction
+    currentInstructionCid : ContractId Token.TransferInstruction
+    stepSeq : Int
+    pendingState : WithdrawalPendingState
+    pendingActions : [Text]
+    metadata : TextMap Text
+    reason : Text
+  where
+    signatory committee
+    observer owner
+
+    ensure
+      Types.nonEmptyText accountId
+        && Types.nonEmptyText instrumentId
+        && Types.nonEmptyText withdrawalId
+        && amountMinor > 0
+        && stepSeq >= 0
+
+    choice AdvanceWithdrawalPending : ContractId WithdrawalPending
+      with
+        nextInstructionCid : ContractId Token.TransferInstruction
+      controller committee
+      do
+        assertMsg "nextInstructionCid must differ from currentInstructionCid" (nextInstructionCid /= currentInstructionCid)
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+
+        nextView <- exercise nextInstructionCid Token.View with requester = committee
+        assertMsg "next instruction must be Pending" (nextView.output == Token.Pending)
+
+        let sc = fromSome nextView.statusClass
+        assertStatusClassAllowed sc cfg.allowedWithdrawalPendingStatusClasses
+
+        case nextView.originalInstructionCid of
+          Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+          None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+        assertMsg "sender mismatch" (nextView.sender == committee)
+        assertMsg "receiver mismatch" (nextView.receiver == owner)
+        assertMsg "instrument mismatch" (nextView.instrumentAdmin == instrumentAdmin && nextView.instrumentId == instrumentId)
+        assertMsg "amountMinor mismatch" (nextView.amountMinor == amountMinor)
+        assertMsg "metadata fingerprint mismatch" (nextView.metadata == metadata)
+        assertMsg "reason fingerprint mismatch" (nextView.reason == reason)
+
+        acctMeta <- requireMeta metaAccountIdKey nextView.metadata
+        assertMsg "metadata accountId mismatch" (acctMeta == accountId)
+
+        wdMeta <- requireMeta metaWithdrawalIdKey nextView.metadata
+        assertMsg "metadata withdrawalId mismatch" (wdMeta == withdrawalId)
+
+        create this with
+          currentInstructionCid = nextInstructionCid
+          stepSeq = stepSeq + 1
+          pendingActions = nextView.pendingActions
+
+    choice FinalizeAccepted : ContractId WithdrawalReceipt
+      with
+        terminalInstructionCid : ContractId Token.TransferInstruction
+      controller committee
+      do
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+
+        view <- exercise terminalInstructionCid Token.View with requester = committee
+        assertMsg "instruction is not Completed" (view.output == Token.Completed)
+
+        case view.originalInstructionCid of
+          Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+          None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+        assertMsg "sender mismatch" (view.sender == committee)
+        assertMsg "receiver mismatch" (view.receiver == owner)
+        assertMsg "instrument mismatch" (view.instrumentAdmin == instrumentAdmin && view.instrumentId == instrumentId)
+        assertMsg "amountMinor mismatch" (view.amountMinor == amountMinor)
+        assertMsg "metadata fingerprint mismatch" (view.metadata == metadata)
+        assertMsg "reason fingerprint mismatch" (view.reason == reason)
+
+        create WithdrawalReceipt with
+          committee
+          owner
+          accountId
+          instrumentAdmin
+          instrumentId
+          withdrawalId
+          amountMinor
+          status = Completed
+          lineageRootInstructionCid
+          terminalInstructionCid
+
+    choice FinalizeRejected : (ContractId Account.AccountState, ContractId WithdrawalReceipt)
+      with
+        accountStateCid : ContractId Account.AccountState
+        terminalInstructionCid : ContractId Token.TransferInstruction
+      controller committee
+      do
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+
+        view <- exercise terminalInstructionCid Token.View with requester = committee
+        assertMsg "instruction is not Failed" (view.output == Token.Failed)
+
+        case view.originalInstructionCid of
+          Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+          None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+        assertMsg "sender mismatch" (view.sender == committee)
+        assertMsg "receiver mismatch" (view.receiver == owner)
+        assertMsg "instrument mismatch" (view.instrumentAdmin == instrumentAdmin && view.instrumentId == instrumentId)
+        assertMsg "amountMinor mismatch" (view.amountMinor == amountMinor)
+        assertMsg "metadata fingerprint mismatch" (view.metadata == metadata)
+        assertMsg "reason fingerprint mismatch" (view.reason == reason)
+
+        st <- fetch accountStateCid
+        assertMsg "AccountState.accountId mismatch" (st.accountId == accountId)
+        assertMsg "AccountState.owner mismatch" (st.owner == owner)
+        assertMsg "AccountState.instrument mismatch" (st.instrumentAdmin == instrumentAdmin && st.instrumentId == instrumentId)
+
+        stCid1 <- exercise accountStateCid Account.Credit with amountMinor = amountMinor
+
+        receiptCid <- create WithdrawalReceipt with
+          committee
+          owner
+          accountId
+          instrumentAdmin
+          instrumentId
+          withdrawalId
+          amountMinor
+          status = Refunded
+          lineageRootInstructionCid
+          terminalInstructionCid
+
+        pure (stCid1, receiptCid)
+
+    choice CancelAndMaybeRefund : (Optional (ContractId WithdrawalPending), Optional (ContractId Account.AccountState), Optional (ContractId WithdrawalReceipt))
+      with
+        accountStateCid : ContractId Account.AccountState
+      controller committee
+      do
+        assertMsg "CancelAndMaybeRefund only supported from OfferPending in M2 mock" (pendingState == OfferPending)
+
+        cfg <- fetch tokenConfigCid
+        assertMsg "instrument mismatch (TokenConfig)" (cfg.instrumentAdmin == instrumentAdmin && cfg.instrumentId == instrumentId)
+
+        nextInstrCid <- exercise currentInstructionCid Token.Withdraw
+        nextView <- exercise nextInstrCid Token.View with requester = committee
+
+        case nextView.output of
+          Token.Failed -> do
+            case nextView.originalInstructionCid of
+              Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+              None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+            assertMsg "sender mismatch" (nextView.sender == committee)
+            assertMsg "receiver mismatch" (nextView.receiver == owner)
+            assertMsg "instrument mismatch" (nextView.instrumentAdmin == instrumentAdmin && nextView.instrumentId == instrumentId)
+            assertMsg "amountMinor mismatch" (nextView.amountMinor == amountMinor)
+            assertMsg "metadata fingerprint mismatch" (nextView.metadata == metadata)
+            assertMsg "reason fingerprint mismatch" (nextView.reason == reason)
+
+            st <- fetch accountStateCid
+            assertMsg "AccountState.accountId mismatch" (st.accountId == accountId)
+            assertMsg "AccountState.owner mismatch" (st.owner == owner)
+            assertMsg "AccountState.instrument mismatch" (st.instrumentAdmin == instrumentAdmin && st.instrumentId == instrumentId)
+
+            stCid1 <- exercise accountStateCid Account.Credit with amountMinor = amountMinor
+            receiptCid <- create WithdrawalReceipt with
+              committee
+              owner
+              accountId
+              instrumentAdmin
+              instrumentId
+              withdrawalId
+              amountMinor
+              status = Refunded
+              lineageRootInstructionCid
+              terminalInstructionCid = nextInstrCid
+            pure (None, Some stCid1, Some receiptCid)
+          Token.Completed -> do
+            case nextView.originalInstructionCid of
+              Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+              None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+            assertMsg "sender mismatch" (nextView.sender == committee)
+            assertMsg "receiver mismatch" (nextView.receiver == owner)
+            assertMsg "instrument mismatch" (nextView.instrumentAdmin == instrumentAdmin && nextView.instrumentId == instrumentId)
+            assertMsg "amountMinor mismatch" (nextView.amountMinor == amountMinor)
+            assertMsg "metadata fingerprint mismatch" (nextView.metadata == metadata)
+            assertMsg "reason fingerprint mismatch" (nextView.reason == reason)
+
+            receiptCid <- create WithdrawalReceipt with
+              committee
+              owner
+              accountId
+              instrumentAdmin
+              instrumentId
+              withdrawalId
+              amountMinor
+              status = Completed
+              lineageRootInstructionCid
+              terminalInstructionCid = nextInstrCid
+            pure (None, None, Some receiptCid)
+          Token.Pending -> do
+            case nextView.originalInstructionCid of
+              Some root -> assertMsg "lineage root mismatch" (root == lineageRootInstructionCid)
+              None -> assertMsg "missing originalInstructionCid (strict mode)" (not cfg.requiresOriginalInstructionCid)
+
+            assertMsg "sender mismatch" (nextView.sender == committee)
+            assertMsg "receiver mismatch" (nextView.receiver == owner)
+            assertMsg "instrument mismatch" (nextView.instrumentAdmin == instrumentAdmin && nextView.instrumentId == instrumentId)
+            assertMsg "amountMinor mismatch" (nextView.amountMinor == amountMinor)
+            assertMsg "metadata fingerprint mismatch" (nextView.metadata == metadata)
+            assertMsg "reason fingerprint mismatch" (nextView.reason == reason)
+
+            let sc = fromSome nextView.statusClass
+            let allowed = sc `elem` cfg.allowedCancelPendingStatusClasses
+            let newState = if allowed then CancelPending else CancelEscalated
+
+            pendingCid <- create this with
+              currentInstructionCid = nextInstrCid
+              stepSeq = stepSeq + 1
+              pendingState = newState
+              pendingActions = nextView.pendingActions
+
+            pure (Some pendingCid, None, None)
+
+data WithdrawalReceiptStatus = Completed | Refunded
+  deriving (Eq, Show)
+
+template WithdrawalReceipt
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    withdrawalId : Text
+    amountMinor : Types.AmountMinor
+    status : WithdrawalReceiptStatus
+    lineageRootInstructionCid : ContractId Token.TransferInstruction
+    terminalInstructionCid : ContractId Token.TransferInstruction
+  where
+    signatory committee
+    observer owner
+
+    ensure
+      Types.nonEmptyText accountId
+        && Types.nonEmptyText instrumentId
+        && Types.nonEmptyText withdrawalId
+        && amountMinor > 0
+
+-- --------------------
+-- Quarantine
+-- --------------------
+
+template QuarantinedHolding
+  with
+    committee : Party
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    holdingCid : ContractId Token.Holding
+    discoveredAt : Time
+    reason : Text
+    relatedAccountId : Optional Types.AccountId
+    relatedDepositId : Optional Text
+  where
+    signatory committee
+
+    ensure
+      Types.nonEmptyText instrumentId
+        && reason /= ""

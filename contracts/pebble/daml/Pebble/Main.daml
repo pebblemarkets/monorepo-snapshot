@@ -1,0 +1,12 @@
+module Pebble.Main where
+
+-- Placeholder. Replace with the templates in prompts/misc/03-arch-v3.1-l.md.
+template Dummy
+  with
+    issuer : Party
+    owner : Party
+    -- Daml surface type is `Int` (64-bit signed). Ledger API calls this `int64`.
+    amountMinor : Int
+  where
+    signatory issuer
+    observer owner

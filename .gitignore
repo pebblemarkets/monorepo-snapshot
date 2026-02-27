@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+dist/
+.vite/
+
+# Rust
+target/
+
+# Daml / dpm
+.daml/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Logs
+log/
+*.log
+
+__pycache__
+
+data/assets

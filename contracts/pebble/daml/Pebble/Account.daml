@@ -1,0 +1,203 @@
+module Pebble.Account where
+
+import Pebble.Clearing as Clearing
+import Pebble.Types as Types
+
+-- Accounts are represented by two contracts:
+-- - AccountRef: stable identity + lifecycle for an (owner, instrument).
+-- - AccountState: cleared cash liabilities for that account/instrument.
+--
+-- Canton/Daml 3.x does not support contract keys; off-ledger services must track the latest
+-- active CIDs by accountId.
+
+data AccountStatus = Active | Suspending | Suspended | Closed
+  deriving (Eq, Show)
+
+data AccountRefView = AccountRefView
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    status : AccountStatus
+    finalizedEpoch : Optional Types.Epoch
+  deriving (Eq, Show)
+
+template AccountRef
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    status : AccountStatus
+    -- Set only once suspension is finalized (cut-line).
+    finalizedEpoch : Optional Types.Epoch
+  where
+    signatory committee
+    observer owner
+
+    ensure
+      Types.nonEmptyText accountId
+        && Types.nonEmptyText instrumentId
+        && (case status of
+          Active -> finalizedEpoch == None
+          Suspending -> finalizedEpoch == None
+          Suspended -> finalizedEpoch /= None
+          Closed -> finalizedEpoch /= None)
+        && (case finalizedEpoch of
+          None -> True
+          Some e -> e >= 0)
+
+    choice RequestExit : ContractId AccountRef
+      controller owner
+      do
+        assertMsg "account is not Active" (status == Active)
+        create this with status = Suspending
+
+    choice CancelExit : ContractId AccountRef
+      controller owner
+      do
+        assertMsg "account is not Suspending" (status == Suspending)
+        create this with status = Active
+
+    choice FinalizeSuspension : ContractId AccountRef
+      with
+        epoch : Types.Epoch
+      controller committee
+      do
+        assertMsg "account is not Suspending" (status == Suspending)
+        assertMsg "epoch must be >= 0" (epoch >= 0)
+        create this with
+          status = Suspended
+          finalizedEpoch = Some epoch
+
+    choice Resume : ContractId AccountRef
+      controller committee
+      do
+        assertMsg "account is not Suspended" (status == Suspended)
+        create this with
+          status = Active
+          finalizedEpoch = None
+
+    choice CloseAccount : ContractId AccountRef
+      with
+        accountStateCid : ContractId AccountState
+      controller committee
+      do
+        assertMsg "account is not Suspended" (status == Suspended)
+
+        st <- fetch accountStateCid
+        assertMsg "AccountState.accountId mismatch" (st.accountId == accountId)
+        assertMsg "AccountState.instrument mismatch" (st.instrumentAdmin == instrumentAdmin && st.instrumentId == instrumentId)
+        assertMsg "AccountState cleared cash must be zero" (st.clearedCashMinor == 0)
+
+        case finalizedEpoch of
+          None -> pure ()
+          Some e -> assertMsg "AccountState not caught up to finalized epoch" (st.lastAppliedEpoch >= e)
+
+        create this with status = Closed
+
+data AccountStateView = AccountStateView
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    clearedCashMinor : Types.AmountMinor
+    lastAppliedEpoch : Types.Epoch
+    lastAppliedBatchAnchor : Optional (ContractId Clearing.BatchAnchor)
+  deriving (Eq, Show)
+
+template AccountState
+  with
+    committee : Party
+    owner : Party
+    accountId : Types.AccountId
+    instrumentAdmin : Party
+    instrumentId : Types.InstrumentId
+    clearedCashMinor : Types.AmountMinor
+    lastAppliedEpoch : Types.Epoch
+    lastAppliedBatchAnchor : Optional (ContractId Clearing.BatchAnchor)
+  where
+    signatory committee
+    observer owner
+
+    ensure
+      Types.nonEmptyText accountId
+        && Types.nonEmptyText instrumentId
+        && clearedCashMinor >= 0
+        && lastAppliedEpoch >= 0
+        && (lastAppliedEpoch == 0) == (lastAppliedBatchAnchor == None)
+
+    choice ApplyClearingDelta : ContractId AccountState
+      with
+        batchAnchorCid : ContractId Clearing.BatchAnchor
+        deltaMinor : Types.AmountMinor
+      controller committee
+      do
+        anchor <- fetch batchAnchorCid
+        assertMsg "instrument mismatch" (anchor.instrumentAdmin == instrumentAdmin && anchor.instrumentId == instrumentId)
+        assertMsg "epoch must advance" (anchor.epoch > lastAppliedEpoch)
+
+        let newCleared = clearedCashMinor + deltaMinor
+        assertMsg "cleared cash would become negative" (newCleared >= 0)
+
+        create this with
+          clearedCashMinor = newCleared
+          lastAppliedEpoch = anchor.epoch
+          lastAppliedBatchAnchor = Some batchAnchorCid
+
+    choice Credit : ContractId AccountState
+      with
+        amountMinor : Types.AmountMinor
+      controller committee
+      do
+        assertMsg "amountMinor must be > 0" (amountMinor > 0)
+        create this with clearedCashMinor = clearedCashMinor + amountMinor
+
+    choice Debit : ContractId AccountState
+      with
+        amountMinor : Types.AmountMinor
+      controller committee
+      do
+        assertMsg "amountMinor must be > 0" (amountMinor > 0)
+        assertMsg "insufficient cleared cash" (clearedCashMinor >= amountMinor)
+        create this with clearedCashMinor = clearedCashMinor - amountMinor
+
+    nonconsuming choice Fetch : AccountStateView
+      with
+        requester : Party
+      controller requester
+      do
+        pure AccountStateView
+          with
+            committee
+            owner
+            accountId
+            instrumentAdmin
+            instrumentId
+            clearedCashMinor
+            lastAppliedEpoch
+            lastAppliedBatchAnchor
+
+    nonconsuming choice FetchRef : AccountRefView
+      with
+        requester : Party
+        accountRefCid : ContractId AccountRef
+      controller requester
+      do
+        ref <- fetch accountRefCid
+        assertMsg "AccountRef.accountId mismatch" (ref.accountId == accountId)
+        assertMsg "AccountRef.instrument mismatch" (ref.instrumentAdmin == instrumentAdmin && ref.instrumentId == instrumentId)
+        pure AccountRefView
+          with
+            committee = ref.committee
+            owner = ref.owner
+            accountId = ref.accountId
+            instrumentAdmin = ref.instrumentAdmin
+            instrumentId = ref.instrumentId
+            status = ref.status
+            finalizedEpoch = ref.finalizedEpoch

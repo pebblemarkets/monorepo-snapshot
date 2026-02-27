@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pebble
+      POSTGRES_PASSWORD: pebble
+      POSTGRES_DB: pebble
+    ports:
+      - "5432:5432"
+    volumes:
+      - pebble-postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - pebble-redis:/data
+
+  # Optional: Canton sandbox. In early dev, prefer running `dpm sandbox` on-host.
+  # canton-sandbox:
+  #   image: TODO
+  #   ports:
+  #     - "6865:6865"   # Ledger API
+  #     - "7575:7575"   # JSON API (if enabled)
+
+volumes:
+  pebble-postgres:
+  pebble-redis:
+

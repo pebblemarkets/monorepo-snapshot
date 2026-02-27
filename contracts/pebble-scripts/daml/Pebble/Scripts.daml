@@ -1,0 +1,68 @@
+module Pebble.Scripts where
+
+import Daml.Script
+
+import qualified Pebble.Scripts.M1 as M1
+import qualified Pebble.Scripts.M2 as M2
+import qualified Pebble.Scripts.M2OffLedger as M2OffLedger
+import qualified Pebble.Scripts.M3 as M3
+import qualified Pebble.Scripts.M3E2E as M3E2E
+import qualified Pebble.Scripts.LiveBootstrap as LiveBootstrap
+import qualified Pebble.Scripts.LiveFunding as LiveFunding
+
+-- Placeholder init script. Wire this up to real init/mint/demo flows.
+setup : Script ()
+setup = pure ()
+
+-- M1 acceptance script entrypoint.
+testM1 : Script ()
+testM1 = M1.testM1
+
+-- M2 acceptance script entrypoint.
+testM2 : Script M2.M2Summary
+testM2 = M2.testM2
+
+-- M2 hardening: per-instrument minimum deposit threshold.
+testM2DepositThreshold : Script ()
+testM2DepositThreshold = M2.testM2DepositThreshold
+
+-- M2 hardening: cancel/accept race + CancelEscalated evidence.
+testM2CancelRace : Script ()
+testM2CancelRace = M2.testM2CancelRace
+
+-- M2 off-ledger acceptance script entrypoint (requires treasury service running).
+testM2OffLedger : Script M2OffLedger.M2OffLedgerSummary
+testM2OffLedger = M2OffLedger.testM2OffLedger
+
+-- M2 off-ledger hardening: reservation-lag probe.
+testM2OffLedgerReservationLag : Script M2OffLedger.M2ReservationLagSummary
+testM2OffLedgerReservationLag = M2OffLedger.testM2OffLedgerReservationLag
+
+-- M2 off-ledger hardening: 50-withdrawal dust-inventory stress.
+testM2OffLedgerUtxoStress : Script M2OffLedger.M2StressSummary
+testM2OffLedgerUtxoStress = M2OffLedger.testM2OffLedgerUtxoStress
+
+-- M3 bootstrap for off-ledger order matching / clearing tests.
+testM3Bootstrap : Script M3.M3BootstrapSummary
+testM3Bootstrap = M3.testM3Bootstrap
+
+-- M3 bootstrap for catch-up acceptance (3 accounts).
+testM3CatchupBootstrap : Script M3.M3CatchupBootstrapSummary
+testM3CatchupBootstrap = M3.testM3CatchupBootstrap
+
+-- M3 end-to-end bootstrap (deposits complete via treasury automation).
+testM3E2EBootstrap : Script M3E2E.M3E2EBootstrapSummary
+testM3E2EBootstrap = M3E2E.testM3E2EBootstrap
+
+-- M3 end-to-end withdrawal phase (after trade + clearing).
+testM3E2EWithdraw : Script M3E2E.M3E2EWithdrawSummary
+testM3E2EWithdraw = M3E2E.testM3E2EWithdraw
+
+-- Idempotent bootstrap for a live-demo instrument:
+-- ensures TokenConfig/FeeSchedule/OracleConfig/ClearingHead exist.
+bootstrapLiveInstrument : LiveBootstrap.LiveBootstrapInput -> Script ()
+bootstrapLiveInstrument = LiveBootstrap.ensureLiveInstrumentBootstrap
+
+-- Live-demo funding flow: mint -> claim -> deposit offers for user accounts.
+fundLiveDemoAccounts : LiveFunding.LiveFundingInput -> Script ()
+fundLiveDemoAccounts = LiveFunding.fundLiveDemoAccounts

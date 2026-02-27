@@ -1,0 +1,45 @@
+module Pebble.Scripts.OneShotPolicy where
+
+import Daml.Script
+
+import qualified Wizardcat.Token.Standard as Token
+
+data Input = Input
+  with
+    instrumentAdmin : Party
+    instrumentId : Text
+    committee : Party
+  deriving (Eq, Show)
+
+-- Idempotently create the WithdrawalAutoAccept operator policy for the committee flow.
+createPolicy : Input -> Script ()
+createPolicy input = script do
+  let instrumentAdmin = input.instrumentAdmin
+  let instrumentId = input.instrumentId
+  let committee = input.committee
+
+  if instrumentId == "" then
+    abort "instrumentId must be non-empty"
+  else pure ()
+
+  policies <- query @Token.OperatorAcceptPolicy committee
+  let matches = filter
+        (\(_, p) ->
+          p.instrumentAdmin == instrumentAdmin
+            && p.instrumentId == instrumentId
+            && p.authorizer == committee
+            && p.operator == committee
+            && p.mode == Token.operatorAcceptModeWithdrawalAutoAccept)
+        policies
+
+  case matches of
+    [] -> do
+      _ <- submit [instrumentAdmin, committee] do
+        createCmd Token.OperatorAcceptPolicy with
+          instrumentAdmin
+          instrumentId
+          authorizer = committee
+          operator = committee
+          mode = Token.operatorAcceptModeWithdrawalAutoAccept
+      pure ()
+    _ -> pure ()

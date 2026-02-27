@@ -1,0 +1,686 @@
+module Wizardcat.Token.Standard where
+
+import DA.Assert (assertMsg)
+import DA.Optional (fromSome)
+import DA.TextMap (TextMap)
+import qualified DA.TextMap as TM
+
+-- Minimal mock of CIP-56-style UTXO holdings + transfer instructions.
+--
+-- This is intentionally a dev-only mock designed to support Pebble M2. The contract
+-- surface area is biased toward what Pebble needs (offers + receiver acceptance,
+-- pending progression, and sender withdrawals/cancel attempts).
+
+fetchAll : [ContractId a] -> (ContractId a -> Update a) -> Update [a]
+fetchAll cids fetchOne =
+  case cids of
+    [] -> pure []
+    cid :: rest -> do
+      x <- fetchOne cid
+      xs <- fetchAll rest fetchOne
+      pure (x :: xs)
+
+forEach_ : [a] -> (a -> Update ()) -> Update ()
+forEach_ xs f =
+  case xs of
+    [] -> pure ()
+    x :: rest -> do
+      f x
+      forEach_ rest f
+
+data TransferOutput = Pending | Completed | Failed
+  deriving (Eq, Show)
+
+mockOutcomeFromMetadata : Text -> TextMap Text -> TransferOutput -> TransferOutput
+mockOutcomeFromMetadata key metadata defaultOutput =
+  case TM.lookup key metadata of
+    Some "Pending" -> Pending
+    Some "Completed" -> Completed
+    Some "Failed" -> Failed
+    Some "pending" -> Pending
+    Some "completed" -> Completed
+    Some "failed" -> Failed
+    _ -> defaultOutput
+
+statusClassReceiverAcceptance : Text
+statusClassReceiverAcceptance = "TransferPendingReceiverAcceptance"
+
+statusClassInternalWorkflow : Text
+statusClassInternalWorkflow = "TransferPendingInternalWorkflow"
+
+operatorAcceptModeWithdrawalAutoAccept : Text
+operatorAcceptModeWithdrawalAutoAccept = "WithdrawalAutoAccept"
+
+metadataFlowKey : Text
+metadataFlowKey = "wizardcat.xyz/pebble.flow"
+
+metadataAccountIdKey : Text
+metadataAccountIdKey = "wizardcat.xyz/pebble.accountId"
+
+metadataWithdrawalIdKey : Text
+metadataWithdrawalIdKey = "wizardcat.xyz/pebble.withdrawalId"
+
+metadataWithdrawalFlow : Text
+metadataWithdrawalFlow = "Withdrawal"
+
+data HoldingLock = HoldingLock
+  with
+    statusClass : Text
+    expiresAt : Time
+  deriving (Eq, Show)
+
+data HoldingView = HoldingView
+  with
+    owner : Party
+    instrumentAdmin : Party
+    instrumentId : Text
+    amountMinor : Int
+    lock : Optional HoldingLock
+    lockOwner : Optional Party
+    originInstructionCid : Optional (ContractId TransferInstruction)
+  deriving (Eq, Show)
+
+template Holding
+  with
+    owner : Party
+    instrumentAdmin : Party
+    instrumentId : Text
+    amountMinor : Int
+    lock : Optional HoldingLock
+    -- When locked, identifies the party allowed to consume the holding as part of the workflow.
+    -- This lets us model receiver-acceptance and internal-workflow progression without requiring
+    -- multi-party authorization.
+    lockOwner : Optional Party
+    -- Optional attribution anchor used by Pebble for deterministic deposit/withdraw linking.
+    originInstructionCid : Optional (ContractId TransferInstruction)
+  where
+    signatory owner
+    observer
+      instrumentAdmin
+        :: (case lockOwner of
+          None -> []
+          Some p -> [p])
+
+    ensure
+      instrumentId /= ""
+        && amountMinor > 0
+        && (case lock of
+          None -> lockOwner == None
+          Some l -> lockOwner /= None && l.statusClass /= "")
+
+    nonconsuming choice ViewHolding : HoldingView
+      with
+        requester : Party
+      controller requester
+      do
+        pure HoldingView
+          with
+            owner
+            instrumentAdmin
+            instrumentId
+            amountMinor
+            lock
+            lockOwner
+            originInstructionCid
+
+    -- Consumes a locked holding (used by receiver acceptance and internal workflow advancement).
+    choice ConsumeLocked : Int
+      controller fromSome lockOwner
+      do
+        assertMsg "holding is not locked" (lock /= None)
+        assertMsg "lockOwner missing" (lockOwner /= None)
+        pure amountMinor
+
+    choice ConsumeLockedByAuthorizedOperator : Int
+      with
+        authorizedOperator : Party
+        policyCid : ContractId OperatorAcceptPolicy
+        expectedAuthorizer : Party
+        expectedInstrumentAdmin : Party
+        expectedInstrumentId : Text
+      controller authorizedOperator
+      do
+        policy <- fetch policyCid
+        assertMsg "policy mode mismatch" (policy.mode == operatorAcceptModeWithdrawalAutoAccept)
+        assertMsg "policy operator mismatch" (policy.operator == authorizedOperator)
+        assertMsg "policy authorizer mismatch" (policy.authorizer == expectedAuthorizer)
+        assertMsg "policy instrumentAdmin mismatch" (policy.instrumentAdmin == expectedInstrumentAdmin)
+        assertMsg "policy instrumentId mismatch" (policy.instrumentId == expectedInstrumentId)
+        assertMsg "holding owner mismatch" (owner == expectedAuthorizer)
+        assertMsg "holding instrument mismatch" (instrumentAdmin == expectedInstrumentAdmin && instrumentId == expectedInstrumentId)
+        assertMsg "holding is not locked" (lock /= None)
+        assertMsg "lockOwner missing" (lockOwner /= None)
+        pure amountMinor
+
+-- Used to represent outputs created by a third party (e.g. token admin / registry workflow)
+-- that must be claimed by the eventual Holding owner (who is the Holding signatory).
+template HoldingClaim
+  with
+    issuer : Party
+    owner : Party
+    instrumentAdmin : Party
+    instrumentId : Text
+    amountMinor : Int
+    originInstructionCid : Optional (ContractId TransferInstruction)
+  where
+    signatory issuer
+    observer owner, instrumentAdmin
+
+    ensure
+      instrumentId /= ""
+        && amountMinor > 0
+
+    choice Claim : ContractId Holding
+      controller owner
+      do
+        create Holding with
+          owner
+          instrumentAdmin
+          instrumentId
+          amountMinor
+          lock = None
+          lockOwner = None
+          originInstructionCid
+
+template OperatorAcceptPolicy
+  with
+    instrumentAdmin : Party
+    instrumentId : Text
+    authorizer : Party
+    operator : Party
+    mode : Text
+  where
+    signatory instrumentAdmin, authorizer
+    observer operator
+
+    ensure
+      instrumentId /= ""
+        && mode == operatorAcceptModeWithdrawalAutoAccept
+
+data TransferInstructionView = TransferInstructionView
+  with
+    instrumentAdmin : Party
+    instrumentId : Text
+    sender : Party
+    receiver : Party
+    amountMinor : Int
+    metadata : TextMap Text
+    reason : Text
+    output : TransferOutput
+    statusClass : Optional Text
+    originalInstructionCid : Optional (ContractId TransferInstruction)
+    stepSeq : Int
+    pendingActions : [Text]
+    lockedHoldingCid : Optional (ContractId Holding)
+  deriving (Eq, Show)
+
+template TransferInstruction
+  with
+    instrumentAdmin : Party
+    instrumentId : Text
+    sender : Party
+    receiver : Party
+    amountMinor : Int
+    metadata : TextMap Text
+    reason : Text
+    output : TransferOutput
+    statusClass : Optional Text
+    originalInstructionCid : Optional (ContractId TransferInstruction)
+    stepSeq : Int
+    pendingActions : [Text]
+    lockedHoldingCid : Optional (ContractId Holding)
+  where
+    signatory sender
+    observer receiver, instrumentAdmin
+
+    ensure
+      instrumentId /= ""
+        && sender /= receiver
+        && amountMinor > 0
+        && stepSeq >= 0
+        && (case output of
+          Pending -> statusClass /= None && lockedHoldingCid /= None
+          _ -> True)
+
+    nonconsuming choice View : TransferInstructionView
+      with
+        requester : Party
+      controller requester
+      do
+        pure TransferInstructionView
+          with
+            instrumentAdmin
+            instrumentId
+            sender
+            receiver
+            amountMinor
+            metadata
+            reason
+            output
+            statusClass
+            originalInstructionCid
+            stepSeq
+            pendingActions
+            lockedHoldingCid
+
+    -- Receiver accepts an offer (receiver-acceptance pending -> Completed or internal Pending).
+    choice Accept : ContractId TransferInstruction
+      controller receiver
+      do
+        assertMsg "instruction is not Pending" (output == Pending)
+        assertMsg "expected receiver-acceptance status class" (statusClass == Some statusClassReceiverAcceptance)
+
+        let rootCid = case originalInstructionCid of
+              None -> self
+              Some cid -> cid
+
+        let lockedCid = fromSome lockedHoldingCid
+        locked <- fetch lockedCid
+        _ <- exercise lockedCid ConsumeLocked
+
+        let desiredOutput = mockOutcomeFromMetadata "wizardcat.xyz/mock.acceptOutcome" metadata Completed
+
+        case desiredOutput of
+          Completed -> do
+            _ <- create Holding with
+              owner = receiver
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              lock = None
+              lockOwner = None
+              originInstructionCid = Some rootCid
+            create this with
+              output = Completed
+              statusClass = None
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = []
+              lockedHoldingCid = None
+          Pending -> do
+            let sc = statusClassInternalWorkflow
+
+            let expiresAt = (fromSome locked.lock).expiresAt
+            locked2Cid <- create Holding with
+              owner = receiver
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              lock = Some HoldingLock with statusClass = sc, expiresAt
+              lockOwner = Some instrumentAdmin
+              originInstructionCid = Some rootCid
+
+            create this with
+              output = Pending
+              statusClass = Some sc
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = ["Advance"]
+              lockedHoldingCid = Some locked2Cid
+          Failed -> do
+            _ <- create HoldingClaim with
+              issuer = receiver
+              owner = sender
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              originInstructionCid = Some rootCid
+            create this with
+              output = Failed
+              statusClass = None
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = []
+              lockedHoldingCid = None
+
+    choice AcceptByAuthorizedOperator : ContractId TransferInstruction
+      with
+        authorizedOperator : Party
+        policyCid : ContractId OperatorAcceptPolicy
+      controller authorizedOperator
+      do
+        assertMsg "instruction is not Pending" (output == Pending)
+        assertMsg "expected receiver-acceptance status class" (statusClass == Some statusClassReceiverAcceptance)
+
+        policy <- fetch policyCid
+        assertMsg "policy mode mismatch" (policy.mode == operatorAcceptModeWithdrawalAutoAccept)
+        assertMsg "policy instrumentAdmin mismatch" (policy.instrumentAdmin == instrumentAdmin)
+        assertMsg "policy instrumentId mismatch" (policy.instrumentId == instrumentId)
+        assertMsg "policy operator mismatch" (policy.operator == authorizedOperator)
+        assertMsg "policy authorizer mismatch" (policy.authorizer == sender)
+
+        case TM.lookup metadataFlowKey metadata of
+          Some flow -> assertMsg "metadata flow mismatch" (flow == metadataWithdrawalFlow)
+          None -> assertMsg "missing metadata flow marker" False
+        assertMsg "missing metadata accountId marker" (TM.lookup metadataAccountIdKey metadata /= None)
+        assertMsg "missing metadata withdrawalId marker" (TM.lookup metadataWithdrawalIdKey metadata /= None)
+
+        let rootCid = case originalInstructionCid of
+              None -> self
+              Some cid -> cid
+
+        let lockedCid = fromSome lockedHoldingCid
+        locked <- fetch lockedCid
+        _ <- exercise lockedCid ConsumeLockedByAuthorizedOperator with
+          authorizedOperator
+          policyCid
+          expectedAuthorizer = sender
+          expectedInstrumentAdmin = instrumentAdmin
+          expectedInstrumentId = instrumentId
+
+        let desiredOutput = mockOutcomeFromMetadata "wizardcat.xyz/mock.acceptOutcome" metadata Completed
+
+        case desiredOutput of
+          Completed -> do
+            _ <- create HoldingClaim with
+              issuer = authorizedOperator
+              owner = receiver
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              originInstructionCid = Some rootCid
+            create this with
+              output = Completed
+              statusClass = None
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = []
+              lockedHoldingCid = None
+          Pending -> do
+            let sc = statusClassInternalWorkflow
+
+            let expiresAt = (fromSome locked.lock).expiresAt
+            locked2Cid <- create Holding with
+              owner = sender
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              lock = Some HoldingLock with statusClass = sc, expiresAt
+              lockOwner = Some instrumentAdmin
+              originInstructionCid = Some rootCid
+
+            create this with
+              output = Pending
+              statusClass = Some sc
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = ["Advance"]
+              lockedHoldingCid = Some locked2Cid
+          Failed -> do
+            _ <- create HoldingClaim with
+              issuer = authorizedOperator
+              owner = sender
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              originInstructionCid = Some rootCid
+            create this with
+              output = Failed
+              statusClass = None
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = []
+              lockedHoldingCid = None
+
+    -- Internal progression for Pending instructions (simulates registry workflow).
+    choice Advance : ContractId TransferInstruction
+      controller instrumentAdmin
+      do
+        assertMsg "instruction is not Pending" (output == Pending)
+        assertMsg "expected internal-workflow status class" (statusClass == Some statusClassInternalWorkflow)
+
+        let rootCid = case originalInstructionCid of
+              None -> self
+              Some cid -> cid
+
+        let desiredOutput = mockOutcomeFromMetadata "wizardcat.xyz/mock.advanceOutcome" metadata Completed
+
+        case desiredOutput of
+          Completed -> do
+            let lockedCid = fromSome lockedHoldingCid
+            _ <- exercise lockedCid ConsumeLocked
+
+            _ <- create HoldingClaim with
+              issuer = instrumentAdmin
+              owner = receiver
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              originInstructionCid = Some rootCid
+            create this with
+              output = Completed
+              statusClass = None
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = []
+              lockedHoldingCid = None
+          Pending -> do
+            -- Keep the existing locked holding and remain Pending.
+            create this with
+              output = Pending
+              statusClass = Some statusClassInternalWorkflow
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = ["Advance"]
+              lockedHoldingCid
+          Failed -> do
+            let lockedCid = fromSome lockedHoldingCid
+            _ <- exercise lockedCid ConsumeLocked
+
+            _ <- create HoldingClaim with
+              issuer = instrumentAdmin
+              owner = sender
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              originInstructionCid = Some rootCid
+            create this with
+              output = Failed
+              statusClass = None
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = []
+              lockedHoldingCid = None
+
+    -- Sender attempts to withdraw/cancel a pending transfer.
+    choice Withdraw : ContractId TransferInstruction
+      controller sender
+      do
+        assertMsg "instruction is not Pending" (output == Pending)
+        assertMsg "withdraw only allowed from receiver-acceptance pending" (statusClass == Some statusClassReceiverAcceptance)
+
+        let rootCid = case originalInstructionCid of
+              None -> self
+              Some cid -> cid
+
+        -- Only allow withdraw while the locked holding is still sender-owned (pre-accept).
+        let lockedCid = fromSome lockedHoldingCid
+        locked <- fetch lockedCid
+        assertMsg "withdraw is only allowed before receiver acceptance" (locked.owner == sender)
+        exercise lockedCid Archive
+
+        let desiredOutput = mockOutcomeFromMetadata "wizardcat.xyz/mock.withdrawOutcome" metadata Failed
+
+        case desiredOutput of
+          Failed -> do
+            -- Cancel failed -> funds return to sender as unlocked holding.
+            _ <- create Holding with
+              owner = sender
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              lock = None
+              lockOwner = None
+              originInstructionCid = Some rootCid
+            create this with
+              output = Failed
+              statusClass = None
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = []
+              lockedHoldingCid = None
+          Pending -> do
+            -- Cancel pending -> enter internal workflow; instrument admin can advance to terminal.
+            let sc = statusClassInternalWorkflow
+
+            let expiresAt = (fromSome locked.lock).expiresAt
+            locked2Cid <- create Holding with
+              owner = sender
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              lock = Some HoldingLock with statusClass = sc, expiresAt
+              lockOwner = Some instrumentAdmin
+              originInstructionCid = Some rootCid
+
+            create this with
+              output = Pending
+              statusClass = Some sc
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = ["Advance"]
+              lockedHoldingCid = Some locked2Cid
+          Completed -> do
+            -- Treat as terminal completion (e.g. too late to cancel).
+            _ <- create HoldingClaim with
+              issuer = sender
+              owner = receiver
+              instrumentAdmin
+              instrumentId
+              amountMinor
+              originInstructionCid = Some rootCid
+            create this with
+              output = Completed
+              statusClass = None
+              originalInstructionCid = Some rootCid
+              stepSeq = stepSeq + 1
+              pendingActions = []
+              lockedHoldingCid = None
+
+template Faucet
+  with
+    instrumentAdmin : Party
+    instrumentId : Text
+  where
+    signatory instrumentAdmin
+
+    ensure instrumentId /= ""
+
+    choice Mint : ContractId HoldingClaim
+      with
+        owner : Party
+        amountMinor : Int
+      controller instrumentAdmin
+      do
+        assertMsg "amountMinor must be > 0" (amountMinor > 0)
+        create HoldingClaim with
+          issuer = instrumentAdmin
+          owner
+          instrumentAdmin
+          instrumentId
+          amountMinor
+          originInstructionCid = None
+
+template Wallet
+  with
+    owner : Party
+    instrumentAdmin : Party
+    instrumentId : Text
+  where
+    signatory owner
+    observer instrumentAdmin
+
+    ensure instrumentId /= ""
+
+    nonconsuming choice Offer : ContractId TransferInstruction
+      with
+        receiver : Party
+        amountMinor : Int
+        inputHoldingCids : [ContractId Holding]
+        metadata : TextMap Text
+        reason : Text
+        lockExpiresAt : Time
+      controller owner
+      do
+        assertMsg "receiver must differ from owner" (receiver /= owner)
+        assertMsg "amountMinor must be > 0" (amountMinor > 0)
+        assertMsg "inputHoldingCids must be non-empty" (not (null inputHoldingCids))
+
+        holdings <- fetchAll inputHoldingCids fetch
+
+        forEach_ (zip inputHoldingCids holdings) (\(cid, h) -> do
+          assertMsg "holding owner mismatch" (h.owner == owner)
+          assertMsg "holding instrument mismatch" (h.instrumentAdmin == instrumentAdmin && h.instrumentId == instrumentId)
+          assertMsg "holding is locked" (h.lock == None)
+          exercise cid Archive
+          )
+
+        let totalIn = foldl (+) 0 (map (\h -> h.amountMinor) holdings)
+        assertMsg "insufficient input amount" (totalIn >= amountMinor)
+
+        let change = totalIn - amountMinor
+        if change > 0 then do
+          _ <- create Holding with
+            owner
+            instrumentAdmin
+            instrumentId
+            amountMinor = change
+            lock = None
+            lockOwner = None
+            originInstructionCid = None
+          pure ()
+        else pure ()
+
+        lockedCid <- create Holding with
+          owner
+          instrumentAdmin
+          instrumentId
+          amountMinor
+          lock = Some HoldingLock with statusClass = statusClassReceiverAcceptance, expiresAt = lockExpiresAt
+          lockOwner = Some receiver
+          originInstructionCid = None
+
+        create TransferInstruction with
+          instrumentAdmin
+          instrumentId
+          sender = owner
+          receiver
+          amountMinor
+          metadata
+          reason
+          output = Pending
+          statusClass = Some statusClassReceiverAcceptance
+          originalInstructionCid = None
+          stepSeq = 0
+          pendingActions = ["Accept", "Withdraw"]
+          lockedHoldingCid = Some lockedCid
+
+    -- Dev-only: merge multiple unlocked holdings into a single unlocked holding.
+    -- This is a Pebble treasury convenience for keeping UTXO counts under control.
+    nonconsuming choice Consolidate : ContractId Holding
+      with
+        inputHoldingCids : [ContractId Holding]
+      controller owner
+      do
+        assertMsg "inputHoldingCids must be non-empty" (not (null inputHoldingCids))
+
+        holdings <- fetchAll inputHoldingCids fetch
+
+        forEach_ (zip inputHoldingCids holdings) (\(cid, h) -> do
+          assertMsg "holding owner mismatch" (h.owner == owner)
+          assertMsg "holding instrument mismatch" (h.instrumentAdmin == instrumentAdmin && h.instrumentId == instrumentId)
+          assertMsg "holding is locked" (h.lock == None)
+          exercise cid Archive
+          )
+
+        let total = foldl (+) 0 (map (\h -> h.amountMinor) holdings)
+        assertMsg "consolidation total must be > 0" (total > 0)
+
+        create Holding with
+          owner
+          instrumentAdmin
+          instrumentId
+          amountMinor = total
+          lock = None
+          lockOwner = None
+          originInstructionCid = None
