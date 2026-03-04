@@ -22,7 +22,7 @@ partyMatchesHint hint p =
 getOrAllocateParty : Text -> Script Party
 getOrAllocateParty hint = do
   known <- listKnownParties
-  case filter (\pd -> partyMatchesHint hint pd.party) known of
+  case filter (\pd -> partyMatchesHint hint pd.party && pd.isLocal) known of
     (pd :: _) -> pure pd.party
     [] -> allocatePartyByHint (PartyIdHint hint)
 
@@ -34,7 +34,7 @@ getOrAllocateParty hint = do
 -- - exercises account lifecycle transitions.
 --
 -- Run (example):
---   daml script --dar .daml/dist/pebble-scripts-0.1.0.dar --script-name Pebble.Scripts.M1:testM1
+--   dpm script --dar .daml/dist/pebble-scripts-0.1.0.dar --script-name Pebble.Scripts.M1:testM1
 testM1 : Script ()
 testM1 = script do
   committee <- getOrAllocateParty "PebbleCommittee"

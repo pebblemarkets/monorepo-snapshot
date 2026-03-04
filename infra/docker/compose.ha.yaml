@@ -1,0 +1,98 @@
+x-api-env: &api-env
+  PEBBLE_DB_URL: postgres://pebble:pebble@postgres:5432/pebble
+  PEBBLE_FLUID_ENABLED: "true"
+  PEBBLE_FLUID_ROLE: "auto"
+  PEBBLE_FLUID_REPLICATION_ADDR: "0.0.0.0:3031"
+  PEBBLE_FLUID_REPLICATION_AUTH_TOKEN: "dev-shared-secret-change-me"
+  PEBBLE_FLUID_REPLICATION_MODE: "semi-sync"
+  PEBBLE_FLUID_POST_FSYNC_FAILURE_POLICY: "strict"
+  PEBBLE_FLUID_RECONCILE_HMAC_KEY: "dev-reconcile-hmac-key-change-me"
+  PEBBLE_API_ADDR: "0.0.0.0:3030"
+  PEBBLE_WAL_DIR: "/app/wal"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pebble
+      POSTGRES_PASSWORD: pebble
+      POSTGRES_DB: pebble
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c tcp_keepalives_idle=5
+        -c tcp_keepalives_interval=1
+        -c tcp_keepalives_count=2
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pebble"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  api-1:
+    image: pebble-services:latest
+    command: ["/usr/local/bin/pebble-api"]
+    environment:
+      <<: *api-env
+      PEBBLE_FLUID_NODE_ID: "node-1"
+      PEBBLE_FLUID_REPLICATION_ADVERTISE_ADDR: "api-1:3031"
+    ports:
+      - "3030:3030"
+      - "3031:3031"
+    volumes:
+      - wal-1:/app/wal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-2:
+    image: pebble-services:latest
+    command: ["/usr/local/bin/pebble-api"]
+    environment:
+      <<: *api-env
+      PEBBLE_FLUID_NODE_ID: "node-2"
+      PEBBLE_FLUID_REPLICATION_ADVERTISE_ADDR: "api-2:3031"
+    ports:
+      - "3032:3030"
+      - "3033:3031"
+    volumes:
+      - wal-2:/app/wal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-3:
+    image: pebble-services:latest
+    command: ["/usr/local/bin/pebble-api"]
+    environment:
+      <<: *api-env
+      PEBBLE_FLUID_NODE_ID: "node-3"
+      PEBBLE_FLUID_REPLICATION_ADVERTISE_ADDR: "api-3:3031"
+    ports:
+      - "3034:3030"
+      - "3035:3031"
+    volumes:
+      - wal-3:/app/wal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  haproxy:
+    image: haproxy:2.9
+    ports:
+      - "8080:80"
+    volumes:
+      - ./haproxy-ha.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - api-1
+      - api-2
+      - api-3
+
+volumes:
+  pgdata:
+  wal-1:
+  wal-2:
+  wal-3:

@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1-bookworm AS builder
+WORKDIR /app
+
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+COPY Cargo.toml Cargo.lock ./
+COPY apps ./apps
+COPY crates ./crates
+COPY infra/sql ./infra/sql
+COPY proto ./proto
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/.cargo-target \
+    CARGO_TARGET_DIR=/app/.cargo-target cargo build --release \
+      -p pebble-api \
+      -p pebble-indexer \
+      -p pebble-clearing \
+      -p pebble-treasury \
+      -p pebble-assets \
+  && mkdir -p /app/target/release \
+  && cp /app/.cargo-target/release/pebble-api /app/target/release/pebble-api \
+  && cp /app/.cargo-target/release/pebble-indexer /app/target/release/pebble-indexer \
+  && cp /app/.cargo-target/release/pebble-clearing /app/target/release/pebble-clearing \
+  && cp /app/.cargo-target/release/pebble-treasury /app/target/release/pebble-treasury \
+  && cp /app/.cargo-target/release/pebble-assets /app/target/release/pebble-assets
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl tini \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/pebble-api /usr/local/bin/pebble-api
+COPY --from=builder /app/target/release/pebble-indexer /usr/local/bin/pebble-indexer
+COPY --from=builder /app/target/release/pebble-clearing /usr/local/bin/pebble-clearing
+COPY --from=builder /app/target/release/pebble-treasury /usr/local/bin/pebble-treasury
+COPY --from=builder /app/target/release/pebble-assets /usr/local/bin/pebble-assets
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/pebble-api"]

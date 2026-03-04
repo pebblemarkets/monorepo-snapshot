@@ -180,6 +180,13 @@ fn match_order_with_book(
             quantity_minor: matched_qty,
             sequence,
             engine_version: engine_version.to_string(),
+            canonical_price_ticks: resting.price_ticks,
+            maker_outcome: resting.outcome.clone(),
+            maker_side: resting.side,
+            maker_price_ticks: resting.price_ticks,
+            taker_outcome: incoming.outcome.clone(),
+            taker_side: incoming.side,
+            taker_price_ticks: resting.price_ticks,
         });
 
         maker_updates.push(MakerUpdate {

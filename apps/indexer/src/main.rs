@@ -978,6 +978,25 @@ async fn handle_token_config_created(
         serde_json::to_value(&allowed_cancel_pending_status_classes)
             .context("serialize allowedCancelPendingStatusClasses")?;
 
+    // Preserve uniqueness for active config rows even when Created is observed before Archived.
+    sqlx::query(
+        r#"
+        UPDATE token_configs
+        SET active = FALSE, last_offset = $3
+        WHERE instrument_admin = $1
+          AND instrument_id = $2
+          AND contract_id <> $4
+          AND active = TRUE
+        "#,
+    )
+    .bind(instrument_admin.clone())
+    .bind(instrument_id.clone())
+    .bind(offset)
+    .bind(created.contract_id.clone())
+    .execute(&mut **dbtx)
+    .await
+    .context("deactivate prior active token_config rows")?;
+
     sqlx::query(
         r#"
         INSERT INTO token_configs (
@@ -1105,6 +1124,25 @@ async fn handle_fee_schedule_created(
 
     let created_at = created_at_utc(&created)?;
 
+    // Preserve uniqueness for active schedule rows even when Created is observed before Archived.
+    sqlx::query(
+        r#"
+        UPDATE fee_schedules
+        SET active = FALSE, last_offset = $3
+        WHERE instrument_admin = $1
+          AND instrument_id = $2
+          AND contract_id <> $4
+          AND active = TRUE
+        "#,
+    )
+    .bind(instrument_admin.clone())
+    .bind(instrument_id.clone())
+    .bind(offset)
+    .bind(created.contract_id.clone())
+    .execute(&mut **dbtx)
+    .await
+    .context("deactivate prior active fee_schedule rows")?;
+
     sqlx::query(
         r#"
         INSERT INTO fee_schedules (
@@ -1179,6 +1217,25 @@ async fn handle_oracle_config_created(
     let mode = get_enum(&fields, "mode")?;
 
     let created_at = created_at_utc(&created)?;
+
+    // Preserve uniqueness for active oracle rows even when Created is observed before Archived.
+    sqlx::query(
+        r#"
+        UPDATE oracle_configs
+        SET active = FALSE, last_offset = $3
+        WHERE instrument_admin = $1
+          AND instrument_id = $2
+          AND contract_id <> $4
+          AND active = TRUE
+        "#,
+    )
+    .bind(instrument_admin.clone())
+    .bind(instrument_id.clone())
+    .bind(offset)
+    .bind(created.contract_id.clone())
+    .execute(&mut **dbtx)
+    .await
+    .context("deactivate prior active oracle_config rows")?;
 
     sqlx::query(
         r#"
@@ -1255,6 +1312,29 @@ async fn handle_account_ref_created(
     let finalized_epoch = get_optional_int64(&fields, "finalizedEpoch")?;
 
     let created_at = created_at_utc(&created)?;
+
+    // Preserve uniqueness for active non-Closed account refs even when Created is observed
+    // before the corresponding Archived of the previous contract.
+    sqlx::query(
+        r#"
+        UPDATE account_refs
+        SET active = FALSE, last_offset = $5
+        WHERE owner_party = $1
+          AND instrument_admin = $2
+          AND instrument_id = $3
+          AND contract_id <> $4
+          AND active = TRUE
+          AND status <> 'Closed'
+        "#,
+    )
+    .bind(owner_party.clone())
+    .bind(instrument_admin.clone())
+    .bind(instrument_id.clone())
+    .bind(created.contract_id.clone())
+    .bind(offset)
+    .execute(&mut **dbtx)
+    .await
+    .context("deactivate prior active account_ref rows")?;
 
     sqlx::query(
         r#"
@@ -1491,6 +1571,25 @@ async fn handle_clearing_head_created(
     let last_batch_anchor = get_optional_contract_id(&fields, "lastBatchAnchor")?;
 
     let created_at = created_at_utc(&created)?;
+
+    // Preserve uniqueness for active clearing head rows even when Created is observed first.
+    sqlx::query(
+        r#"
+        UPDATE clearing_heads
+        SET active = FALSE, last_offset = $3
+        WHERE instrument_admin = $1
+          AND instrument_id = $2
+          AND contract_id <> $4
+          AND active = TRUE
+        "#,
+    )
+    .bind(instrument_admin.clone())
+    .bind(instrument_id.clone())
+    .bind(offset)
+    .bind(created.contract_id.clone())
+    .execute(&mut **dbtx)
+    .await
+    .context("deactivate prior active clearing_head rows")?;
 
     sqlx::query(
         r#"

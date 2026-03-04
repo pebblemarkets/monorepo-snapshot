@@ -9,6 +9,7 @@ axum = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 pebble-daml-grpc = { path = "../../crates/daml-grpc" }
+pebble-fluid = { path = "../../crates/fluid" }
 pebble-ids = { path = "../../crates/ids" }
 serde_json = "1"
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "migrate", "chrono", "json"] }

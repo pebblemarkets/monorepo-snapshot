@@ -1,0 +1,19 @@
+[package]
+name = "pebble-fluid"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+pebble-trading = { path = "../trading" }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync", "rt", "io-util"] }
+rmp-serde = "1"
+crc32c = "0.6"
+slab = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

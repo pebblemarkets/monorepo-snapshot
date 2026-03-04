@@ -48,6 +48,12 @@ impl OrderId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InternalOrderId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InternalAccountId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OrderNonce(pub i64);
 
 impl OrderNonce {
@@ -214,6 +220,13 @@ pub struct Fill {
     pub quantity_minor: i64,
     pub sequence: i64,
     pub engine_version: String,
+    pub canonical_price_ticks: i64,
+    pub maker_outcome: String,
+    pub maker_side: OrderSide,
+    pub maker_price_ticks: i64,
+    pub taker_outcome: String,
+    pub taker_side: OrderSide,
+    pub taker_price_ticks: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

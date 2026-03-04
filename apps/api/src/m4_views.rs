@@ -1,4 +1,12 @@
-use std::{collections::HashSet, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use anyhow::Context as _;
 use axum::{
@@ -10,14 +18,18 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json as SqlJson, PgPool};
-use tokio::sync::Mutex;
-use tokio_stream::{wrappers::IntervalStream, StreamExt as _};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio_stream::{
+    wrappers::{IntervalStream, ReceiverStream},
+    StreamExt as _,
+};
 use uuid::Uuid;
 
 use crate::{ApiError, AppState};
 
 const DEFAULT_QUERY_LIMIT: i64 = 100;
 const MAX_QUERY_LIMIT: i64 = 500;
+const MAX_PORTFOLIO_HISTORY_QUERY_LIMIT: i64 = 80;
 const CHART_STREAM_BATCH_LIMIT: i64 = 200;
 const CHART_STREAM_POLL_MS_DEFAULT: u64 = 1_000;
 const CHART_STREAM_POLL_MS_MIN: u64 = 250;
@@ -185,31 +197,18 @@ pub(crate) async fn get_session(
     let admin_key = optional_header(&headers, "x-admin-key")?;
     reject_mixed_auth_headers(&user_key, &admin_key)?;
 
-    let account_id = match user_key {
-        Some(key) => {
-            let Some(account_id) = state.auth_keys.account_id_for_api_key(&key) else {
-                return Err(ApiError::unauthorized("invalid API key"));
-            };
-            Some(account_id)
-        }
-        None => None,
-    };
-
-    let is_admin = match admin_key {
+    let (account_id, is_admin) = match admin_key {
         Some(key) => {
             if !state.auth_keys.is_admin_key(&key) {
                 return Err(ApiError::unauthorized("invalid admin API key"));
             }
-            true
+            (None, true)
         }
-        None => false,
+        None => {
+            let auth = crate::authenticate_user_request(&state, &headers).await?;
+            (Some(auth.account_id), false)
+        }
     };
-
-    if account_id.is_none() && !is_admin {
-        return Err(ApiError::unauthorized(
-            "missing x-api-key or x-admin-key header",
-        ));
-    }
 
     Ok(Json(SessionView {
         account_id,
@@ -297,7 +296,7 @@ struct OrderBookLevelRow {
     order_count: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct OrderBookLevelView {
     pub(crate) outcome: String,
     pub(crate) price_ticks: i64,
@@ -305,17 +304,283 @@ pub(crate) struct OrderBookLevelView {
     pub(crate) order_count: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct MarketOrderBookView {
     pub(crate) market_id: String,
     pub(crate) bids: Vec<OrderBookLevelView>,
     pub(crate) asks: Vec<OrderBookLevelView>,
 }
 
-pub(crate) async fn get_market_order_book(
-    State(state): State<AppState>,
-    Path(market_id): Path<String>,
-) -> Result<Json<MarketOrderBookView>, ApiError> {
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct OrderBookLevelKeyView {
+    pub(crate) side: String,
+    pub(crate) outcome: String,
+    pub(crate) price_ticks: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct OrderBookDeltaLevelView {
+    pub(crate) side: String,
+    pub(crate) outcome: String,
+    pub(crate) price_ticks: i64,
+    pub(crate) quantity_minor: i64,
+    pub(crate) order_count: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MarketOrderBookDeltaEvent {
+    pub(crate) market_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) generated_at: DateTime<Utc>,
+    pub(crate) upserts: Vec<OrderBookDeltaLevelView>,
+    pub(crate) removes: Vec<OrderBookLevelKeyView>,
+}
+
+#[derive(Clone)]
+pub(crate) struct OrderBookStreamHub {
+    inner: Arc<OrderBookStreamHubInner>,
+}
+
+struct OrderBookStreamHubInner {
+    streams: Mutex<HashMap<String, Arc<OrderBookProducer>>>,
+    poll_interval: Duration,
+    idle_ttl: Duration,
+}
+
+struct OrderBookProducer {
+    latest_snapshot_tx: watch::Sender<Option<MarketOrderBookView>>,
+    delta_tx: broadcast::Sender<MarketOrderBookDeltaEvent>,
+    subscriber_count: AtomicUsize,
+    sequence: AtomicU64,
+}
+
+struct OrderBookStreamSubscription {
+    producer: Arc<OrderBookProducer>,
+    snapshot_rx: watch::Receiver<Option<MarketOrderBookView>>,
+    delta_rx: broadcast::Receiver<MarketOrderBookDeltaEvent>,
+}
+
+impl Drop for OrderBookStreamSubscription {
+    fn drop(&mut self) {
+        let _ = self.producer.subscriber_count.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(1),
+        );
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct OrderBookLevelKey {
+    side: String,
+    outcome: String,
+    price_ticks: i64,
+}
+
+impl OrderBookStreamHub {
+    pub(crate) fn new(poll_interval: Duration, idle_ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(OrderBookStreamHubInner {
+                streams: Mutex::new(HashMap::new()),
+                poll_interval,
+                idle_ttl,
+            }),
+        }
+    }
+
+    async fn subscribe(&self, db: PgPool, market_id: String) -> OrderBookStreamSubscription {
+        let producer = {
+            let mut streams = self.inner.streams.lock().await;
+            if let Some(existing) = streams.get(&market_id) {
+                Arc::clone(existing)
+            } else {
+                let (latest_snapshot_tx, _) = watch::channel(None);
+                let (delta_tx, _) = broadcast::channel(512);
+                let producer = Arc::new(OrderBookProducer {
+                    latest_snapshot_tx,
+                    delta_tx,
+                    subscriber_count: AtomicUsize::new(0),
+                    sequence: AtomicU64::new(0),
+                });
+                streams.insert(market_id.clone(), Arc::clone(&producer));
+                spawn_order_book_producer_task(
+                    Arc::clone(&self.inner),
+                    db,
+                    market_id.clone(),
+                    Arc::clone(&producer),
+                );
+                producer
+            }
+        };
+
+        producer.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        OrderBookStreamSubscription {
+            producer: Arc::clone(&producer),
+            snapshot_rx: producer.latest_snapshot_tx.subscribe(),
+            delta_rx: producer.delta_tx.subscribe(),
+        }
+    }
+}
+
+fn spawn_order_book_producer_task(
+    hub: Arc<OrderBookStreamHubInner>,
+    db: PgPool,
+    market_id: String,
+    producer: Arc<OrderBookProducer>,
+) {
+    tokio::spawn(async move {
+        let mut poll_interval = tokio::time::interval(hub.poll_interval);
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        poll_interval.tick().await;
+
+        let mut previous_snapshot: Option<MarketOrderBookView> = None;
+        let mut no_subscribers_since: Option<Instant> = None;
+
+        loop {
+            match load_market_order_book_snapshot(&db, &market_id).await {
+                Ok(snapshot) => {
+                    let _ = producer.latest_snapshot_tx.send(Some(snapshot.clone()));
+
+                    if let Some(previous) = &previous_snapshot {
+                        let next_sequence = producer.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(delta) =
+                            compute_order_book_delta(&market_id, previous, &snapshot, next_sequence)
+                        {
+                            let _ = producer.delta_tx.send(delta);
+                        }
+                    }
+
+                    previous_snapshot = Some(snapshot);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = ?err,
+                        market_id = %market_id,
+                        "order book stream producer poll failed"
+                    );
+                }
+            }
+
+            if producer.subscriber_count.load(Ordering::Relaxed) == 0 {
+                if let Some(since) = no_subscribers_since {
+                    if since.elapsed() >= hub.idle_ttl {
+                        break;
+                    }
+                } else {
+                    no_subscribers_since = Some(Instant::now());
+                }
+            } else {
+                no_subscribers_since = None;
+            }
+
+            poll_interval.tick().await;
+        }
+
+        let mut streams = hub.streams.lock().await;
+        if let Some(existing) = streams.get(&market_id) {
+            if Arc::ptr_eq(existing, &producer) {
+                streams.remove(&market_id);
+            }
+        }
+    });
+}
+
+fn order_book_level_key(side: &str, outcome: &str, price_ticks: i64) -> OrderBookLevelKey {
+    OrderBookLevelKey {
+        side: side.to_string(),
+        outcome: outcome.to_string(),
+        price_ticks,
+    }
+}
+
+fn compute_order_book_delta(
+    market_id: &str,
+    previous: &MarketOrderBookView,
+    current: &MarketOrderBookView,
+    sequence: u64,
+) -> Option<MarketOrderBookDeltaEvent> {
+    let mut previous_levels: HashMap<OrderBookLevelKey, (i64, i64)> = HashMap::new();
+    for level in &previous.bids {
+        previous_levels.insert(
+            order_book_level_key("Buy", &level.outcome, level.price_ticks),
+            (level.quantity_minor, level.order_count),
+        );
+    }
+    for level in &previous.asks {
+        previous_levels.insert(
+            order_book_level_key("Sell", &level.outcome, level.price_ticks),
+            (level.quantity_minor, level.order_count),
+        );
+    }
+
+    let mut current_levels: HashMap<OrderBookLevelKey, (i64, i64)> = HashMap::new();
+    for level in &current.bids {
+        current_levels.insert(
+            order_book_level_key("Buy", &level.outcome, level.price_ticks),
+            (level.quantity_minor, level.order_count),
+        );
+    }
+    for level in &current.asks {
+        current_levels.insert(
+            order_book_level_key("Sell", &level.outcome, level.price_ticks),
+            (level.quantity_minor, level.order_count),
+        );
+    }
+
+    let mut upserts = Vec::new();
+    for (level_key, value) in &current_levels {
+        if previous_levels.get(level_key) != Some(value) {
+            upserts.push(OrderBookDeltaLevelView {
+                side: level_key.side.clone(),
+                outcome: level_key.outcome.clone(),
+                price_ticks: level_key.price_ticks,
+                quantity_minor: value.0,
+                order_count: value.1,
+            });
+        }
+    }
+
+    let mut removes = Vec::new();
+    for level_key in previous_levels.keys() {
+        if !current_levels.contains_key(level_key) {
+            removes.push(OrderBookLevelKeyView {
+                side: level_key.side.clone(),
+                outcome: level_key.outcome.clone(),
+                price_ticks: level_key.price_ticks,
+            });
+        }
+    }
+
+    if upserts.is_empty() && removes.is_empty() {
+        return None;
+    }
+
+    upserts.sort_by(|left, right| {
+        left.side
+            .cmp(&right.side)
+            .then_with(|| left.outcome.cmp(&right.outcome))
+            .then_with(|| left.price_ticks.cmp(&right.price_ticks))
+    });
+    removes.sort_by(|left, right| {
+        left.side
+            .cmp(&right.side)
+            .then_with(|| left.outcome.cmp(&right.outcome))
+            .then_with(|| left.price_ticks.cmp(&right.price_ticks))
+    });
+
+    Some(MarketOrderBookDeltaEvent {
+        market_id: market_id.to_string(),
+        sequence,
+        generated_at: Utc::now(),
+        upserts,
+        removes,
+    })
+}
+
+async fn load_market_order_book_snapshot(
+    db: &PgPool,
+    market_id: &str,
+) -> Result<MarketOrderBookView, ApiError> {
     let rows: Vec<OrderBookLevelRow> = sqlx::query_as(
         r#"
         SELECT
@@ -331,8 +596,8 @@ pub(crate) async fn get_market_order_book(
         ORDER BY outcome ASC, side ASC, price_ticks ASC
         "#,
     )
-    .bind(&market_id)
-    .fetch_all(&state.db)
+    .bind(market_id)
+    .fetch_all(db)
     .await
     .context("query market order book")?;
 
@@ -365,11 +630,162 @@ pub(crate) async fn get_market_order_book(
             .then_with(|| left.price_ticks.cmp(&right.price_ticks))
     });
 
-    Ok(Json(MarketOrderBookView {
-        market_id,
+    Ok(MarketOrderBookView {
+        market_id: market_id.to_string(),
         bids,
         asks,
-    }))
+    })
+}
+
+pub(crate) async fn get_market_order_book(
+    State(state): State<AppState>,
+    Path(market_id): Path<String>,
+) -> Result<Json<MarketOrderBookView>, ApiError> {
+    let cache_key = format!("book:{market_id}");
+    let ttl = Duration::from_millis(500);
+    let view = state
+        .public_market_order_book_cache
+        .get_or_load(cache_key, ttl, || async {
+            load_market_order_book_snapshot(&state.db, &market_id).await
+        })
+        .await?;
+
+    Ok(Json(view))
+}
+
+pub(crate) async fn stream_market_order_book(
+    State(state): State<AppState>,
+    Path(market_id): Path<String>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let subscription = state
+        .order_book_stream_hub
+        .subscribe(state.db.clone(), market_id.clone())
+        .await;
+    let (tx, rx) = mpsc::channel(128);
+    tokio::spawn(async move {
+        forward_market_order_book_events(subscription, tx, market_id).await;
+    });
+
+    Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+
+async fn forward_market_order_book_events(
+    mut subscription: OrderBookStreamSubscription,
+    tx: mpsc::Sender<Result<Event, Infallible>>,
+    market_id: String,
+) {
+    if !send_order_book_stream_primer_event(&tx).await {
+        return;
+    }
+
+    if let Some(snapshot) = current_or_next_order_book_snapshot(&mut subscription.snapshot_rx).await
+    {
+        if !send_order_book_snapshot_event(&tx, &snapshot).await {
+            return;
+        }
+    } else {
+        tracing::warn!(market_id = %market_id, "order book stream closed before initial snapshot");
+        return;
+    }
+
+    loop {
+        match subscription.delta_rx.recv().await {
+            Ok(delta) => {
+                if !send_order_book_delta_event(&tx, &delta).await {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    market_id = %market_id,
+                    skipped,
+                    "order book stream subscriber lagged; resending snapshot"
+                );
+                let snapshot = subscription.snapshot_rx.borrow().clone();
+                if let Some(snapshot) = snapshot {
+                    if !send_order_book_snapshot_event(&tx, &snapshot).await {
+                        return;
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                return;
+            }
+        }
+    }
+}
+
+async fn send_order_book_stream_primer_event(tx: &mpsc::Sender<Result<Event, Infallible>>) -> bool {
+    // Some edge proxies buffer very small initial SSE chunks.
+    // Emit a one-time primer payload so clients receive the stream promptly.
+    let primer = "0".repeat(4096);
+    tx.send(Ok(Event::default().event("ready").data(primer)))
+        .await
+        .is_ok()
+}
+
+async fn current_or_next_order_book_snapshot(
+    snapshot_rx: &mut watch::Receiver<Option<MarketOrderBookView>>,
+) -> Option<MarketOrderBookView> {
+    if let Some(snapshot) = snapshot_rx.borrow().clone() {
+        return Some(snapshot);
+    }
+
+    loop {
+        if snapshot_rx.changed().await.is_err() {
+            return None;
+        }
+        if let Some(snapshot) = snapshot_rx.borrow().clone() {
+            return Some(snapshot);
+        }
+    }
+}
+
+async fn send_order_book_snapshot_event(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    snapshot: &MarketOrderBookView,
+) -> bool {
+    match serde_json::to_string(snapshot) {
+        Ok(serialized) => tx
+            .send(Ok(Event::default().event("snapshot").data(serialized)))
+            .await
+            .is_ok(),
+        Err(err) => {
+            tracing::error!(error = ?err, "serialize order book snapshot payload failed");
+            tx.send(Ok(Event::default()
+                .event("error")
+                .data("internal server error")))
+                .await
+                .is_ok()
+        }
+    }
+}
+
+async fn send_order_book_delta_event(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    delta: &MarketOrderBookDeltaEvent,
+) -> bool {
+    match serde_json::to_string(delta) {
+        Ok(serialized) => tx
+            .send(Ok(Event::default()
+                .event("delta")
+                .id(delta.sequence.to_string())
+                .data(serialized)))
+            .await
+            .is_ok(),
+        Err(err) => {
+            tracing::error!(error = ?err, "serialize order book delta payload failed");
+            tx.send(Ok(Event::default()
+                .event("error")
+                .data("internal server error")))
+                .await
+                .is_ok()
+        }
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -387,7 +803,26 @@ struct MarketFillRow {
     clearing_epoch: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct MarketFillPerspectiveRow {
+    fill_id: String,
+    fill_sequence: i64,
+    market_id: String,
+    outcome: String,
+    maker_order_id: String,
+    taker_order_id: String,
+    price_ticks: i64,
+    quantity_minor: i64,
+    engine_version: String,
+    matched_at: DateTime<Utc>,
+    clearing_epoch: Option<i64>,
+    maker_outcome: String,
+    taker_outcome: String,
+    maker_price_ticks: i64,
+    taker_price_ticks: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct MarketFillView {
     pub(crate) fill_id: String,
     pub(crate) fill_sequence: i64,
@@ -442,6 +877,17 @@ struct MarketChartUpdateFillRow {
     matched_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct MarketChartUpdatePerspectiveRow {
+    fill_sequence: i64,
+    price_ticks: i64,
+    matched_at: DateTime<Utc>,
+    maker_outcome: String,
+    taker_outcome: String,
+    maker_price_ticks: i64,
+    taker_price_ticks: i64,
+}
+
 fn map_market_fill_row(row: MarketFillRow) -> MarketFillView {
     MarketFillView {
         fill_id: row.fill_id,
@@ -466,40 +912,121 @@ fn map_market_chart_update_fill_row(row: MarketChartUpdateFillRow) -> MarketChar
     }
 }
 
+fn project_price_ticks_for_outcome(
+    legacy_price_ticks: i64,
+    taker_outcome: &str,
+    taker_price_ticks: i64,
+    maker_outcome: &str,
+    maker_price_ticks: i64,
+    requested_outcome: Option<&str>,
+) -> Option<i64> {
+    match requested_outcome {
+        None => Some(legacy_price_ticks),
+        Some(outcome) => {
+            if taker_outcome == outcome {
+                Some(taker_price_ticks)
+            } else if maker_outcome == outcome {
+                Some(maker_price_ticks)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn project_market_fill_row(
+    row: MarketFillPerspectiveRow,
+    requested_outcome: Option<&str>,
+) -> Option<MarketFillRow> {
+    let price_ticks = project_price_ticks_for_outcome(
+        row.price_ticks,
+        &row.taker_outcome,
+        row.taker_price_ticks,
+        &row.maker_outcome,
+        row.maker_price_ticks,
+        requested_outcome,
+    )?;
+
+    let outcome = match requested_outcome {
+        None => row.outcome,
+        Some(outcome) => outcome.to_string(),
+    };
+
+    Some(MarketFillRow {
+        fill_id: row.fill_id,
+        fill_sequence: row.fill_sequence,
+        market_id: row.market_id,
+        outcome,
+        maker_order_id: row.maker_order_id,
+        taker_order_id: row.taker_order_id,
+        price_ticks,
+        quantity_minor: row.quantity_minor,
+        engine_version: row.engine_version,
+        matched_at: row.matched_at,
+        clearing_epoch: row.clearing_epoch,
+    })
+}
+
+fn project_market_chart_update_fill_row(
+    row: MarketChartUpdatePerspectiveRow,
+    requested_outcome: Option<&str>,
+) -> Option<MarketChartUpdateFillRow> {
+    let price_ticks = project_price_ticks_for_outcome(
+        row.price_ticks,
+        &row.taker_outcome,
+        row.taker_price_ticks,
+        &row.maker_outcome,
+        row.maker_price_ticks,
+        requested_outcome,
+    )?;
+    Some(MarketChartUpdateFillRow {
+        fill_sequence: row.fill_sequence,
+        price_ticks,
+        matched_at: row.matched_at,
+    })
+}
+
 pub(crate) async fn list_market_fills(
     State(state): State<AppState>,
     Path(market_id): Path<String>,
     Query(query): Query<ListLimitQuery>,
 ) -> Result<Json<Vec<MarketFillView>>, ApiError> {
     let limit = clamp_limit(query.limit);
+    let cache_key = format!("fills:{market_id}:{limit}");
+    let ttl = Duration::from_secs(1);
+    let fills = state
+        .public_market_fills_cache
+        .get_or_load(cache_key, ttl, || async {
+            let rows: Vec<MarketFillRow> = sqlx::query_as(
+                r#"
+                SELECT
+                  fill_id,
+                  fill_sequence,
+                  market_id,
+                  outcome,
+                  maker_order_id,
+                  taker_order_id,
+                  price_ticks,
+                  quantity_minor,
+                  engine_version,
+                  matched_at,
+                  clearing_epoch
+                FROM fills
+                WHERE market_id = $1
+                ORDER BY matched_at DESC, fill_sequence DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(&market_id)
+            .bind(limit)
+            .fetch_all(&state.db)
+            .await
+            .context("query market fills")?;
 
-    let rows: Vec<MarketFillRow> = sqlx::query_as(
-        r#"
-        SELECT
-          fill_id,
-          fill_sequence,
-          market_id,
-          outcome,
-          maker_order_id,
-          taker_order_id,
-          price_ticks,
-          quantity_minor,
-          engine_version,
-          matched_at,
-          clearing_epoch
-        FROM fills
-        WHERE market_id = $1
-        ORDER BY matched_at DESC, fill_sequence DESC
-        LIMIT $2
-        "#,
-    )
-    .bind(&market_id)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await
-    .context("query market fills")?;
-
-    let fills = rows.into_iter().map(map_market_fill_row).collect();
+            let fills = rows.into_iter().map(map_market_fill_row).collect();
+            Ok(fills)
+        })
+        .await?;
 
     Ok(Json(fills))
 }
@@ -529,7 +1056,7 @@ async fn load_latest_market_fill_row(
     market_id: &str,
     outcome: Option<&str>,
 ) -> Result<Option<MarketFillRow>, ApiError> {
-    let row = sqlx::query_as(
+    let row: Option<MarketFillPerspectiveRow> = sqlx::query_as(
         r#"
         SELECT
           fill_id,
@@ -542,10 +1069,18 @@ async fn load_latest_market_fill_row(
           quantity_minor,
           engine_version,
           matched_at,
-          clearing_epoch
+          clearing_epoch,
+          maker_outcome,
+          taker_outcome,
+          maker_price_ticks,
+          taker_price_ticks
         FROM fills
         WHERE market_id = $1
-          AND ($2::TEXT IS NULL OR outcome = $2)
+          AND (
+            $2::TEXT IS NULL
+            OR taker_outcome = $2
+            OR maker_outcome = $2
+          )
         ORDER BY fill_sequence DESC
         LIMIT 1
         "#,
@@ -556,7 +1091,7 @@ async fn load_latest_market_fill_row(
     .await
     .context("query latest market fill")?;
 
-    Ok(row)
+    Ok(row.and_then(|row| project_market_fill_row(row, outcome)))
 }
 
 async fn load_market_fill_row_before(
@@ -565,7 +1100,7 @@ async fn load_market_fill_row_before(
     before: DateTime<Utc>,
     outcome: Option<&str>,
 ) -> Result<Option<MarketFillRow>, ApiError> {
-    let row = sqlx::query_as(
+    let row: Option<MarketFillPerspectiveRow> = sqlx::query_as(
         r#"
         SELECT
           fill_id,
@@ -578,11 +1113,19 @@ async fn load_market_fill_row_before(
           quantity_minor,
           engine_version,
           matched_at,
-          clearing_epoch
+          clearing_epoch,
+          maker_outcome,
+          taker_outcome,
+          maker_price_ticks,
+          taker_price_ticks
         FROM fills
         WHERE market_id = $1
           AND matched_at < $2
-          AND ($3::TEXT IS NULL OR outcome = $3)
+          AND (
+            $3::TEXT IS NULL
+            OR taker_outcome = $3
+            OR maker_outcome = $3
+          )
         ORDER BY matched_at DESC, fill_sequence DESC
         LIMIT 1
         "#,
@@ -594,7 +1137,7 @@ async fn load_market_fill_row_before(
     .await
     .context("query prior market fill")?;
 
-    Ok(row)
+    Ok(row.and_then(|row| project_market_fill_row(row, outcome)))
 }
 
 async fn load_market_fill_rows_bucketed(
@@ -609,7 +1152,7 @@ async fn load_market_fill_rows_bucketed(
         return Err(ApiError::internal("chart bin size must be > 0"));
     }
 
-    let rows = sqlx::query_as(
+    let rows: Vec<MarketFillPerspectiveRow> = sqlx::query_as(
         r#"
         WITH ranked AS (
           SELECT
@@ -624,6 +1167,10 @@ async fn load_market_fill_rows_bucketed(
             engine_version,
             matched_at,
             clearing_epoch,
+            maker_outcome,
+            taker_outcome,
+            maker_price_ticks,
+            taker_price_ticks,
             ROW_NUMBER() OVER (
               PARTITION BY FLOOR(EXTRACT(EPOCH FROM matched_at) * 1000)::BIGINT / $4
               ORDER BY matched_at DESC, fill_sequence DESC
@@ -632,7 +1179,11 @@ async fn load_market_fill_rows_bucketed(
           WHERE market_id = $1
             AND matched_at >= $2
             AND matched_at <= $3
-            AND ($5::TEXT IS NULL OR outcome = $5)
+            AND (
+              $5::TEXT IS NULL
+              OR taker_outcome = $5
+              OR maker_outcome = $5
+            )
         )
         SELECT
           fill_id,
@@ -645,7 +1196,11 @@ async fn load_market_fill_rows_bucketed(
           quantity_minor,
           engine_version,
           matched_at,
-          clearing_epoch
+          clearing_epoch,
+          maker_outcome,
+          taker_outcome,
+          maker_price_ticks,
+          taker_price_ticks
         FROM ranked
         WHERE bucket_rank = 1
         ORDER BY matched_at ASC, fill_sequence ASC
@@ -660,7 +1215,10 @@ async fn load_market_fill_rows_bucketed(
     .await
     .context("query bucketed market chart fills in range")?;
 
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| project_market_fill_row(row, outcome))
+        .collect())
 }
 
 async fn load_market_chart_update_rows_after_sequence(
@@ -670,16 +1228,24 @@ async fn load_market_chart_update_rows_after_sequence(
     outcome: Option<&str>,
     limit: i64,
 ) -> Result<Vec<MarketChartUpdateFillRow>, ApiError> {
-    let rows = sqlx::query_as(
+    let rows: Vec<MarketChartUpdatePerspectiveRow> = sqlx::query_as(
         r#"
         SELECT
           fill_sequence,
           price_ticks,
-          matched_at
+          matched_at,
+          maker_outcome,
+          taker_outcome,
+          maker_price_ticks,
+          taker_price_ticks
         FROM fills
         WHERE market_id = $1
           AND fill_sequence > $2
-          AND ($3::TEXT IS NULL OR outcome = $3)
+          AND (
+            $3::TEXT IS NULL
+            OR taker_outcome = $3
+            OR maker_outcome = $3
+          )
         ORDER BY fill_sequence ASC
         LIMIT $4
         "#,
@@ -692,7 +1258,10 @@ async fn load_market_chart_update_rows_after_sequence(
     .await
     .context("query market chart incremental update fills")?;
 
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| project_market_chart_update_fill_row(row, outcome))
+        .collect())
 }
 
 fn clamp_chart_stream_poll_interval_ms(raw: Option<u64>) -> u64 {
@@ -1123,7 +1692,7 @@ pub(crate) async fn stream_market_chart_updates(
     ))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct PublicStatsOverviewView {
     pub(crate) tvl_minor: i64,
     pub(crate) volume_24h_minor: i64,
@@ -1157,59 +1726,67 @@ struct PublicOverviewMarketRow {
 pub(crate) async fn get_public_stats_overview(
     State(state): State<AppState>,
 ) -> Result<Json<PublicStatsOverviewView>, ApiError> {
-    let liabilities: PublicOverviewLiabilityRow = sqlx::query_as(
-        r#"
-        SELECT
-          COALESCE(SUM(ast.cleared_cash_minor), 0)::BIGINT AS tvl_minor,
-          COUNT(*)::BIGINT AS accounts_total
-        FROM account_states ast
-        JOIN account_state_latest latest
-          ON latest.account_id = ast.account_id
-         AND latest.contract_id = ast.contract_id
-        WHERE ast.active = TRUE
-        "#,
-    )
-    .fetch_one(&state.db)
-    .await
-    .context("query public liabilities overview")?;
+    let ttl = Duration::from_secs(5);
+    let view = state
+        .public_stats_overview_cache
+        .get_or_load("stats_overview".to_string(), ttl, || async {
+            let liabilities: PublicOverviewLiabilityRow = sqlx::query_as(
+                r#"
+                SELECT
+                  COALESCE(SUM(ast.cleared_cash_minor), 0)::BIGINT AS tvl_minor,
+                  COUNT(*)::BIGINT AS accounts_total
+                FROM account_states ast
+                JOIN account_state_latest latest
+                  ON latest.account_id = ast.account_id
+                 AND latest.contract_id = ast.contract_id
+                WHERE ast.active = TRUE
+                "#,
+            )
+            .fetch_one(&state.db)
+            .await
+            .context("query public liabilities overview")?;
 
-    let fills: PublicOverviewFillRow = sqlx::query_as(
-        r#"
-        SELECT
-          COALESCE(SUM((price_ticks::NUMERIC * quantity_minor::NUMERIC)), 0)::BIGINT AS volume_24h_minor,
-          COUNT(*)::BIGINT AS fills_24h
-        FROM fills
-        WHERE matched_at >= now() - INTERVAL '24 hours'
-        "#,
-    )
-    .fetch_one(&state.db)
-    .await
-    .context("query public fill overview")?;
+            let fills: PublicOverviewFillRow = sqlx::query_as(
+                r#"
+                SELECT
+                  COALESCE(SUM((price_ticks::NUMERIC * quantity_minor::NUMERIC)), 0)::BIGINT AS volume_24h_minor,
+                  COUNT(*)::BIGINT AS fills_24h
+                FROM fills
+                WHERE matched_at >= now() - INTERVAL '24 hours'
+                "#,
+            )
+            .fetch_one(&state.db)
+            .await
+            .context("query public fill overview")?;
 
-    let markets: PublicOverviewMarketRow = sqlx::query_as(
-        r#"
-        SELECT
-          COUNT(*)::BIGINT AS markets_total,
-          COUNT(*) FILTER (WHERE status = 'Open')::BIGINT AS markets_open,
-          COUNT(*) FILTER (WHERE status = 'Resolved')::BIGINT AS markets_resolved
-        FROM markets
-        WHERE active = TRUE
-        "#,
-    )
-    .fetch_one(&state.db)
-    .await
-    .context("query public markets overview")?;
+            let markets: PublicOverviewMarketRow = sqlx::query_as(
+                r#"
+                SELECT
+                  COUNT(*)::BIGINT AS markets_total,
+                  COUNT(*) FILTER (WHERE status = 'Open')::BIGINT AS markets_open,
+                  COUNT(*) FILTER (WHERE status = 'Resolved')::BIGINT AS markets_resolved
+                FROM markets
+                WHERE active = TRUE
+                "#,
+            )
+            .fetch_one(&state.db)
+            .await
+            .context("query public markets overview")?;
 
-    Ok(Json(PublicStatsOverviewView {
-        tvl_minor: liabilities.tvl_minor,
-        volume_24h_minor: fills.volume_24h_minor,
-        fills_24h: fills.fills_24h,
-        markets_total: markets.markets_total,
-        markets_open: markets.markets_open,
-        markets_resolved: markets.markets_resolved,
-        accounts_total: liabilities.accounts_total,
-        generated_at: Utc::now(),
-    }))
+            Ok(PublicStatsOverviewView {
+                tvl_minor: liabilities.tvl_minor,
+                volume_24h_minor: fills.volume_24h_minor,
+                fills_24h: fills.fills_24h,
+                markets_total: markets.markets_total,
+                markets_open: markets.markets_open,
+                markets_resolved: markets.markets_resolved,
+                accounts_total: liabilities.accounts_total,
+                generated_at: Utc::now(),
+            })
+        })
+        .await?;
+
+    Ok(Json(view))
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1226,7 +1803,7 @@ struct PublicMarketStatsRow {
     last_traded_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct PublicMarketStatsView {
     pub(crate) market_id: String,
     pub(crate) question: String,
@@ -1277,7 +1854,7 @@ pub(crate) async fn list_my_positions(
     headers: HeaderMap,
     Query(query): Query<ListLimitQuery>,
 ) -> Result<Json<Vec<PositionView>>, ApiError> {
-    let account_id = authenticate_user_account_id(&state, &headers)?;
+    let account_id = authenticate_user_account_id(&state, &headers).await?;
     let limit = clamp_limit(query.limit);
 
     let rows: Vec<PositionRow> = sqlx::query_as(
@@ -1312,10 +1889,14 @@ pub(crate) async fn list_my_positions(
         LEFT JOIN latest_market lm
           ON lm.market_id = p.market_id
         LEFT JOIN LATERAL (
-          SELECT f.price_ticks
+          SELECT
+            CASE
+              WHEN f.taker_outcome = p.outcome THEN f.taker_price_ticks
+              ELSE f.maker_price_ticks
+            END AS price_ticks
           FROM fills f
           WHERE f.market_id = p.market_id
-            AND f.outcome = p.outcome
+            AND (f.taker_outcome = p.outcome OR f.maker_outcome = p.outcome)
           ORDER BY f.matched_at DESC, f.fill_sequence DESC
           LIMIT 1
         ) last_fill ON TRUE
@@ -1381,10 +1962,45 @@ pub(crate) async fn list_my_portfolio_history(
     headers: HeaderMap,
     Query(query): Query<ListLimitQuery>,
 ) -> Result<Json<Vec<PortfolioHistoryView>>, ApiError> {
-    let account_id = authenticate_user_account_id(&state, &headers)?;
-    let limit = clamp_limit(query.limit);
+    let account_id = authenticate_user_account_id(&state, &headers).await?;
+    let limit = clamp_portfolio_history_limit(query.limit);
 
-    let rows: Vec<PortfolioHistoryRow> = sqlx::query_as(
+    let rows = match query_portfolio_history_mark_to_market(&state.db, &account_id, limit).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                account_id = %account_id,
+                limit,
+                "portfolio history mark-to-market query failed; falling back to cash-only history"
+            );
+            query_portfolio_history_cash_only(&state.db, &account_id, limit).await?
+        }
+    };
+
+    let out = rows
+        .into_iter()
+        .map(|row| PortfolioHistoryView {
+            contract_id: row.contract_id,
+            account_id: row.account_id,
+            cleared_cash_minor: row.cleared_cash_minor,
+            position_mark_value_minor: row.position_mark_value_minor,
+            total_equity_minor: row.total_equity_minor,
+            last_applied_epoch: row.last_applied_epoch,
+            created_at: row.created_at,
+            active: row.active,
+        })
+        .collect();
+
+    Ok(Json(out))
+}
+
+async fn query_portfolio_history_mark_to_market(
+    db: &PgPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<PortfolioHistoryRow>, ApiError> {
+    sqlx::query_as(
         r#"
         WITH snapshots AS (
           SELECT
@@ -1402,30 +2018,26 @@ pub(crate) async fn list_my_portfolio_history(
         account_fills AS (
           SELECT
             f.market_id,
-            f.outcome,
+            f.maker_outcome AS outcome,
             f.matched_at,
             f.fill_sequence,
             CASE
-              WHEN o.side = 'Buy' THEN f.quantity_minor
+              WHEN f.maker_side = 'Buy' THEN f.quantity_minor
               ELSE -f.quantity_minor
             END AS signed_qty_minor
           FROM fills f
-          JOIN orders o
-            ON o.order_id = f.maker_order_id
           WHERE f.maker_account_id = $1
           UNION ALL
           SELECT
             f.market_id,
-            f.outcome,
+            f.taker_outcome AS outcome,
             f.matched_at,
             f.fill_sequence,
             CASE
-              WHEN o.side = 'Buy' THEN f.quantity_minor
+              WHEN f.taker_side = 'Buy' THEN f.quantity_minor
               ELSE -f.quantity_minor
             END AS signed_qty_minor
           FROM fills f
-          JOIN orders o
-            ON o.order_id = f.taker_order_id
           WHERE f.taker_account_id = $1
         ),
         snapshot_positions AS (
@@ -1448,10 +2060,14 @@ pub(crate) async fn list_my_portfolio_history(
             COALESCE(mark.price_ticks, 0)::BIGINT AS mark_price_ticks
           FROM snapshot_positions sp
           LEFT JOIN LATERAL (
-            SELECT f.price_ticks
+            SELECT
+              CASE
+                WHEN f.taker_outcome = sp.outcome THEN f.taker_price_ticks
+                ELSE f.maker_price_ticks
+              END AS price_ticks
             FROM fills f
             WHERE f.market_id = sp.market_id
-              AND f.outcome = sp.outcome
+              AND (f.taker_outcome = sp.outcome OR f.maker_outcome = sp.outcome)
               AND f.matched_at <= sp.snapshot_created_at
             ORDER BY f.matched_at DESC, f.fill_sequence DESC
             LIMIT 1
@@ -1486,27 +2102,42 @@ pub(crate) async fn list_my_portfolio_history(
         ORDER BY s.created_at DESC, s.contract_id DESC
         "#,
     )
-    .bind(&account_id)
+    .bind(account_id)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
-    .context("query my portfolio history")?;
+    .context("query my portfolio history")
+    .map_err(ApiError::from)
+}
 
-    let out = rows
-        .into_iter()
-        .map(|row| PortfolioHistoryView {
-            contract_id: row.contract_id,
-            account_id: row.account_id,
-            cleared_cash_minor: row.cleared_cash_minor,
-            position_mark_value_minor: row.position_mark_value_minor,
-            total_equity_minor: row.total_equity_minor,
-            last_applied_epoch: row.last_applied_epoch,
-            created_at: row.created_at,
-            active: row.active,
-        })
-        .collect();
-
-    Ok(Json(out))
+async fn query_portfolio_history_cash_only(
+    db: &PgPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<PortfolioHistoryRow>, ApiError> {
+    sqlx::query_as(
+        r#"
+        SELECT
+          contract_id,
+          account_id,
+          cleared_cash_minor,
+          0::BIGINT AS position_mark_value_minor,
+          cleared_cash_minor::BIGINT AS total_equity_minor,
+          last_applied_epoch,
+          created_at,
+          active
+        FROM account_states
+        WHERE account_id = $1
+        ORDER BY created_at DESC, contract_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(account_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .context("query my portfolio history (cash-only fallback)")
+    .map_err(ApiError::from)
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1537,7 +2168,7 @@ struct MarketMetadataCurrentRow {
     thumbnail_image_url: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct MarketMetadataView {
     pub(crate) market_id: String,
     pub(crate) question: String,
@@ -1565,72 +2196,81 @@ pub(crate) async fn list_market_metadata(
     let market_id = market_id.filter(|value| !value.is_empty());
     let tag = query.tag.map(|value| value.trim().to_string());
     let tag = tag.filter(|value| !value.is_empty());
+    let featured = query.featured;
+    let cache_key =
+        format!("market_metadata:{limit}:{market_id:?}:{category:?}:{tag:?}:{featured:?}");
+    let ttl = Duration::from_secs(30);
+    let out = state
+        .public_market_metadata_cache
+        .get_or_load(cache_key, ttl, || async {
+            let rows: Vec<MarketMetadataRow> = sqlx::query_as(
+                r#"
+                WITH latest_market AS (
+                  SELECT DISTINCT ON (m.market_id)
+                    m.market_id,
+                    m.question,
+                    m.outcomes,
+                    m.status,
+                    m.created_at
+                  FROM markets m
+                  WHERE m.active = TRUE
+                  ORDER BY m.market_id, m.created_at DESC, m.last_offset DESC, m.contract_id DESC
+                )
+                SELECT
+                  lm.market_id,
+                  lm.question,
+                  lm.outcomes,
+                  lm.status,
+                  lm.created_at,
+                  COALESCE(mm.category, 'General') AS category,
+                  COALESCE(mm.tags, '[]'::jsonb) AS tags,
+                  COALESCE(mm.featured, FALSE) AS featured,
+                  mm.resolution_time,
+                  mm.card_background_image_url,
+                  mm.hero_background_image_url,
+                  mm.thumbnail_image_url,
+                  mm.updated_at
+                FROM latest_market lm
+                LEFT JOIN market_metadata mm
+                  ON mm.market_id = lm.market_id
+                WHERE ($1::TEXT IS NULL OR lm.market_id = $1)
+                  AND ($2::TEXT IS NULL OR COALESCE(mm.category, 'General') = $2)
+                  AND ($3::TEXT IS NULL OR COALESCE(mm.tags, '[]'::jsonb) ? $3)
+                  AND ($4::BOOL IS NULL OR COALESCE(mm.featured, FALSE) = $4)
+                ORDER BY COALESCE(mm.featured, FALSE) DESC, lm.created_at DESC, lm.market_id ASC
+                LIMIT $5
+                "#,
+            )
+            .bind(market_id.clone())
+            .bind(category.clone())
+            .bind(tag.clone())
+            .bind(featured)
+            .bind(limit)
+            .fetch_all(&state.db)
+            .await
+            .context("query market metadata")?;
 
-    let rows: Vec<MarketMetadataRow> = sqlx::query_as(
-        r#"
-        WITH latest_market AS (
-          SELECT DISTINCT ON (m.market_id)
-            m.market_id,
-            m.question,
-            m.outcomes,
-            m.status,
-            m.created_at
-          FROM markets m
-          WHERE m.active = TRUE
-          ORDER BY m.market_id, m.created_at DESC, m.last_offset DESC, m.contract_id DESC
-        )
-        SELECT
-          lm.market_id,
-          lm.question,
-          lm.outcomes,
-          lm.status,
-          lm.created_at,
-          COALESCE(mm.category, 'General') AS category,
-          COALESCE(mm.tags, '[]'::jsonb) AS tags,
-          COALESCE(mm.featured, FALSE) AS featured,
-          mm.resolution_time,
-          mm.card_background_image_url,
-          mm.hero_background_image_url,
-          mm.thumbnail_image_url,
-          mm.updated_at
-        FROM latest_market lm
-        LEFT JOIN market_metadata mm
-          ON mm.market_id = lm.market_id
-        WHERE ($1::TEXT IS NULL OR lm.market_id = $1)
-          AND ($2::TEXT IS NULL OR COALESCE(mm.category, 'General') = $2)
-          AND ($3::TEXT IS NULL OR COALESCE(mm.tags, '[]'::jsonb) ? $3)
-          AND ($4::BOOL IS NULL OR COALESCE(mm.featured, FALSE) = $4)
-        ORDER BY COALESCE(mm.featured, FALSE) DESC, lm.created_at DESC, lm.market_id ASC
-        LIMIT $5
-        "#,
-    )
-    .bind(market_id)
-    .bind(category)
-    .bind(tag)
-    .bind(query.featured)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await
-    .context("query market metadata")?;
-
-    let out = rows
-        .into_iter()
-        .map(|row| MarketMetadataView {
-            market_id: row.market_id,
-            question: row.question,
-            outcomes: row.outcomes.0,
-            status: row.status,
-            created_at: row.created_at,
-            category: row.category,
-            tags: row.tags.0,
-            featured: row.featured,
-            resolution_time: row.resolution_time,
-            card_background_image_url: row.card_background_image_url,
-            hero_background_image_url: row.hero_background_image_url,
-            thumbnail_image_url: row.thumbnail_image_url,
-            updated_at: row.updated_at,
+            let out = rows
+                .into_iter()
+                .map(|row| MarketMetadataView {
+                    market_id: row.market_id,
+                    question: row.question,
+                    outcomes: row.outcomes.0,
+                    status: row.status,
+                    created_at: row.created_at,
+                    category: row.category,
+                    tags: row.tags.0,
+                    featured: row.featured,
+                    resolution_time: row.resolution_time,
+                    card_background_image_url: row.card_background_image_url,
+                    hero_background_image_url: row.hero_background_image_url,
+                    thumbnail_image_url: row.thumbnail_image_url,
+                    updated_at: row.updated_at,
+                })
+                .collect();
+            Ok(out)
         })
-        .collect();
+        .await?;
 
     Ok(Json(out))
 }
@@ -1952,98 +2592,111 @@ pub(crate) async fn list_public_market_stats(
     let limit = clamp_limit(query.limit);
     let market_id = query.market_id.map(|value| value.trim().to_string());
     let market_id = market_id.filter(|value| !value.is_empty());
-
-    let rows: Vec<PublicMarketStatsRow> = sqlx::query_as(
-        r#"
-        SELECT
-          m.market_id,
-          m.question,
-          m.status,
-          m.resolved_outcome,
-          m.created_at,
-          COALESCE(f24.fills_24h, 0)::BIGINT AS fills_24h,
-          COALESCE(f24.volume_24h_minor, 0)::BIGINT AS volume_24h_minor,
-          COALESCE(oi.open_interest_minor, 0)::BIGINT AS open_interest_minor,
-          flast.last_traded_price_ticks,
-          flast.last_traded_at
-        FROM markets m
-        LEFT JOIN LATERAL (
-          SELECT
-            COUNT(*)::BIGINT AS fills_24h,
-            COALESCE(SUM((price_ticks::NUMERIC * quantity_minor::NUMERIC)), 0)::BIGINT AS volume_24h_minor
-          FROM fills f
-          WHERE f.market_id = m.market_id
-            AND f.matched_at >= now() - INTERVAL '24 hours'
-        ) f24 ON TRUE
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(SUM(p.net_quantity_minor), 0)::BIGINT AS open_interest_minor
-          FROM positions p
-          WHERE p.market_id = m.market_id
-            AND p.net_quantity_minor > 0
-        ) oi ON TRUE
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(
-              (
-                SELECT normalized.outcome_text
-                FROM (
+    let cache_key = format!("stats_markets:{limit}:{market_id:?}");
+    let ttl = Duration::from_secs(5);
+    let out = state
+        .public_market_stats_cache
+        .get_or_load(cache_key, ttl, || async {
+            let rows: Vec<PublicMarketStatsRow> = sqlx::query_as(
+                r#"
+                SELECT
+                  m.market_id,
+                  m.question,
+                  m.status,
+                  m.resolved_outcome,
+                  m.created_at,
+                  COALESCE(f24.fills_24h, 0)::BIGINT AS fills_24h,
+                  COALESCE(f24.volume_24h_minor, 0)::BIGINT AS volume_24h_minor,
+                  COALESCE(oi.open_interest_minor, 0)::BIGINT AS open_interest_minor,
+                  flast.last_traded_price_ticks,
+                  flast.last_traded_at
+                FROM markets m
+                LEFT JOIN LATERAL (
                   SELECT
-                    BTRIM(raw_outcome.value) AS outcome_text,
-                    LOWER(BTRIM(raw_outcome.value)) AS outcome_norm,
-                    raw_outcome.ordinality AS outcome_index
-                  FROM jsonb_array_elements_text(m.outcomes) WITH ORDINALITY AS raw_outcome(value, ordinality)
-                ) normalized
-                WHERE normalized.outcome_norm IN ('yes', 'true')
-                ORDER BY normalized.outcome_index
-                LIMIT 1
-              ),
-              (
-                SELECT BTRIM(raw_outcome.value)
-                FROM jsonb_array_elements_text(m.outcomes) WITH ORDINALITY AS raw_outcome(value, ordinality)
-                ORDER BY raw_outcome.ordinality
-                LIMIT 1
-              )
-            ) AS chart_outcome
-        ) chart ON TRUE
-        LEFT JOIN LATERAL (
-          SELECT
-            f.price_ticks AS last_traded_price_ticks,
-            f.matched_at AS last_traded_at
-          FROM fills f
-          WHERE f.market_id = m.market_id
-            AND chart.chart_outcome IS NOT NULL
-            AND f.outcome = chart.chart_outcome
-          ORDER BY f.matched_at DESC, f.fill_sequence DESC
-          LIMIT 1
-        ) flast ON TRUE
-        WHERE m.active = TRUE
-          AND ($1::TEXT IS NULL OR m.market_id = $1)
-        ORDER BY m.created_at DESC, m.market_id ASC
-        LIMIT $2
-        "#,
-    )
-    .bind(market_id)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await
-    .context("query public market stats")?;
+                    COUNT(*)::BIGINT AS fills_24h,
+                    COALESCE(SUM((price_ticks::NUMERIC * quantity_minor::NUMERIC)), 0)::BIGINT AS volume_24h_minor
+                  FROM fills f
+                  WHERE f.market_id = m.market_id
+                    AND f.matched_at >= now() - INTERVAL '24 hours'
+                ) f24 ON TRUE
+                LEFT JOIN LATERAL (
+                  SELECT
+                    COALESCE(SUM(p.net_quantity_minor), 0)::BIGINT AS open_interest_minor
+                  FROM positions p
+                  WHERE p.market_id = m.market_id
+                    AND p.net_quantity_minor > 0
+                ) oi ON TRUE
+                LEFT JOIN LATERAL (
+                  SELECT
+                    COALESCE(
+                      (
+                        SELECT normalized.outcome_text
+                        FROM (
+                          SELECT
+                            BTRIM(raw_outcome.value) AS outcome_text,
+                            LOWER(BTRIM(raw_outcome.value)) AS outcome_norm,
+                            raw_outcome.ordinality AS outcome_index
+                          FROM jsonb_array_elements_text(m.outcomes) WITH ORDINALITY AS raw_outcome(value, ordinality)
+                        ) normalized
+                        WHERE normalized.outcome_norm IN ('yes', 'true')
+                        ORDER BY normalized.outcome_index
+                        LIMIT 1
+                      ),
+                      (
+                        SELECT BTRIM(raw_outcome.value)
+                        FROM jsonb_array_elements_text(m.outcomes) WITH ORDINALITY AS raw_outcome(value, ordinality)
+                        ORDER BY raw_outcome.ordinality
+                        LIMIT 1
+                      )
+                    ) AS chart_outcome
+                ) chart ON TRUE
+                LEFT JOIN LATERAL (
+                  SELECT
+                    CASE
+                      WHEN f.taker_outcome = chart.chart_outcome THEN f.taker_price_ticks
+                      ELSE f.maker_price_ticks
+                    END AS last_traded_price_ticks,
+                    f.matched_at AS last_traded_at
+                  FROM fills f
+                  WHERE f.market_id = m.market_id
+                    AND chart.chart_outcome IS NOT NULL
+                    AND (
+                      f.taker_outcome = chart.chart_outcome
+                      OR f.maker_outcome = chart.chart_outcome
+                    )
+                  ORDER BY f.matched_at DESC, f.fill_sequence DESC
+                  LIMIT 1
+                ) flast ON TRUE
+                WHERE m.active = TRUE
+                  AND ($1::TEXT IS NULL OR m.market_id = $1)
+                ORDER BY m.created_at DESC, m.market_id ASC
+                LIMIT $2
+                "#,
+            )
+            .bind(market_id.clone())
+            .bind(limit)
+            .fetch_all(&state.db)
+            .await
+            .context("query public market stats")?;
 
-    let out = rows
-        .into_iter()
-        .map(|row| PublicMarketStatsView {
-            market_id: row.market_id,
-            question: row.question,
-            status: row.status,
-            resolved_outcome: row.resolved_outcome,
-            created_at: row.created_at,
-            fills_24h: row.fills_24h,
-            volume_24h_minor: row.volume_24h_minor,
-            open_interest_minor: row.open_interest_minor,
-            last_traded_price_ticks: row.last_traded_price_ticks,
-            last_traded_at: row.last_traded_at,
+            let out = rows
+                .into_iter()
+                .map(|row| PublicMarketStatsView {
+                    market_id: row.market_id,
+                    question: row.question,
+                    status: row.status,
+                    resolved_outcome: row.resolved_outcome,
+                    created_at: row.created_at,
+                    fills_24h: row.fills_24h,
+                    volume_24h_minor: row.volume_24h_minor,
+                    open_interest_minor: row.open_interest_minor,
+                    last_traded_price_ticks: row.last_traded_price_ticks,
+                    last_traded_at: row.last_traded_at,
+                })
+                .collect();
+            Ok(out)
         })
-        .collect();
+        .await?;
 
     Ok(Json(out))
 }
@@ -2184,7 +2837,7 @@ pub(crate) async fn get_my_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MySummaryView>, ApiError> {
-    let account_id = authenticate_user_account_id(&state, &headers)?;
+    let account_id = authenticate_user_account_id(&state, &headers).await?;
 
     let summary = load_account_summary_row(&state.db, &account_id).await?;
     let token_config =
@@ -2220,7 +2873,7 @@ pub(crate) async fn get_my_funding_capacity(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MyFundingCapacityView>, ApiError> {
-    let account_id = authenticate_user_account_id(&state, &headers)?;
+    let account_id = authenticate_user_account_id(&state, &headers).await?;
     let summary = load_account_summary_row(&state.db, &account_id).await?;
 
     let funding: FundingCapacityRow = sqlx::query_as(
@@ -2275,7 +2928,7 @@ pub(crate) async fn get_my_deposit_instructions(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<DepositInstructionsView>, ApiError> {
-    let account_id = authenticate_user_account_id(&state, &headers)?;
+    let account_id = authenticate_user_account_id(&state, &headers).await?;
 
     let summary = load_account_summary_row(&state.db, &account_id).await?;
     let token_config =
@@ -2358,7 +3011,7 @@ pub(crate) async fn list_my_deposit_pendings(
     headers: HeaderMap,
     Query(query): Query<ListLimitQuery>,
 ) -> Result<Json<Vec<DepositPendingView>>, ApiError> {
-    let account_id = authenticate_user_account_id(&state, &headers)?;
+    let account_id = authenticate_user_account_id(&state, &headers).await?;
     let limit = clamp_limit(query.limit);
 
     let rows: Vec<DepositPendingRow> = sqlx::query_as(
@@ -2467,7 +3120,7 @@ pub(crate) async fn list_my_withdrawal_pendings(
     headers: HeaderMap,
     Query(query): Query<ListLimitQuery>,
 ) -> Result<Json<Vec<WithdrawalPendingView>>, ApiError> {
-    let account_id = authenticate_user_account_id(&state, &headers)?;
+    let account_id = authenticate_user_account_id(&state, &headers).await?;
     let limit = clamp_limit(query.limit);
 
     let rows: Vec<WithdrawalPendingRow> = sqlx::query_as(
@@ -2577,7 +3230,7 @@ pub(crate) async fn list_my_receipts(
     headers: HeaderMap,
     Query(query): Query<ListLimitQuery>,
 ) -> Result<Json<Vec<ReceiptView>>, ApiError> {
-    let account_id = authenticate_user_account_id(&state, &headers)?;
+    let account_id = authenticate_user_account_id(&state, &headers).await?;
     let limit = clamp_limit(query.limit);
 
     let deposit_rows: Vec<DepositReceiptRow> = sqlx::query_as(
@@ -3380,6 +4033,11 @@ fn clamp_limit(limit: Option<i64>) -> i64 {
     raw.clamp(1, MAX_QUERY_LIMIT)
 }
 
+fn clamp_portfolio_history_limit(limit: Option<i64>) -> i64 {
+    let raw = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
+    raw.clamp(1, MAX_PORTFOLIO_HISTORY_QUERY_LIMIT)
+}
+
 fn required_header(headers: &HeaderMap, name: &str) -> Result<String, ApiError> {
     let value = headers
         .get(name)
@@ -3413,24 +4071,12 @@ fn optional_header(headers: &HeaderMap, name: &str) -> Result<Option<String>, Ap
     Ok(Some(value))
 }
 
-fn authenticate_user_account_id(state: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
-    if state.auth_keys.api_key_count() == 0 {
-        return Err(ApiError::unauthorized("no API keys configured"));
-    }
-
-    let admin_key = optional_header(headers, "x-admin-key")?;
-    if admin_key.is_some() {
-        return Err(ApiError::forbidden(
-            "x-admin-key is not allowed on user endpoints",
-        ));
-    }
-
-    let key = required_header(headers, "x-api-key")?;
-    let Some(account_id) = state.auth_keys.account_id_for_api_key(&key) else {
-        return Err(ApiError::unauthorized("invalid API key"));
-    };
-
-    Ok(account_id)
+async fn authenticate_user_account_id(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let auth = crate::authenticate_user_request(state, headers).await?;
+    Ok(auth.account_id)
 }
 
 fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -3457,11 +4103,11 @@ pub(crate) fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(),
     authenticate_admin(state, headers)
 }
 
-pub(crate) fn require_user_account(
+pub(crate) async fn require_user_account(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<String, ApiError> {
-    authenticate_user_account_id(state, headers)
+    authenticate_user_account_id(state, headers).await
 }
 
 fn reject_mixed_auth_headers(
@@ -3725,11 +4371,156 @@ mod tests {
         }
     }
 
+    fn test_fill_perspective_row(
+        fill_sequence: i64,
+        taker_outcome: &str,
+        maker_outcome: &str,
+        taker_price_ticks: i64,
+        maker_price_ticks: i64,
+    ) -> MarketFillPerspectiveRow {
+        MarketFillPerspectiveRow {
+            fill_id: format!("fill-{fill_sequence}"),
+            fill_sequence,
+            market_id: "mkt-1".to_string(),
+            outcome: taker_outcome.to_string(),
+            maker_order_id: "maker".to_string(),
+            taker_order_id: "taker".to_string(),
+            price_ticks: taker_price_ticks,
+            quantity_minor: 1,
+            engine_version: "test".to_string(),
+            matched_at: Utc
+                .timestamp_millis_opt(1_700_000_000_000 + fill_sequence)
+                .single()
+                .expect("valid timestamp"),
+            clearing_epoch: None,
+            maker_outcome: maker_outcome.to_string(),
+            taker_outcome: taker_outcome.to_string(),
+            maker_price_ticks,
+            taker_price_ticks,
+        }
+    }
+
+    fn test_chart_update_perspective_row(
+        fill_sequence: i64,
+        taker_outcome: &str,
+        maker_outcome: &str,
+        taker_price_ticks: i64,
+        maker_price_ticks: i64,
+    ) -> MarketChartUpdatePerspectiveRow {
+        MarketChartUpdatePerspectiveRow {
+            fill_sequence,
+            price_ticks: taker_price_ticks,
+            matched_at: Utc
+                .timestamp_millis_opt(1_700_000_100_000 + fill_sequence)
+                .single()
+                .expect("valid timestamp"),
+            maker_outcome: maker_outcome.to_string(),
+            taker_outcome: taker_outcome.to_string(),
+            maker_price_ticks,
+            taker_price_ticks,
+        }
+    }
+
+    fn test_order_book(
+        market_id: &str,
+        bids: &[(&str, i64, i64, i64)],
+        asks: &[(&str, i64, i64, i64)],
+    ) -> MarketOrderBookView {
+        let bids = bids
+            .iter()
+            .map(
+                |(outcome, price_ticks, quantity_minor, order_count)| OrderBookLevelView {
+                    outcome: (*outcome).to_string(),
+                    price_ticks: *price_ticks,
+                    quantity_minor: *quantity_minor,
+                    order_count: *order_count,
+                },
+            )
+            .collect();
+        let asks = asks
+            .iter()
+            .map(
+                |(outcome, price_ticks, quantity_minor, order_count)| OrderBookLevelView {
+                    outcome: (*outcome).to_string(),
+                    price_ticks: *price_ticks,
+                    quantity_minor: *quantity_minor,
+                    order_count: *order_count,
+                },
+            )
+            .collect();
+
+        MarketOrderBookView {
+            market_id: market_id.to_string(),
+            bids,
+            asks,
+        }
+    }
+
     #[test]
     fn clamp_limit_bounds_values() {
         assert_eq!(clamp_limit(None), DEFAULT_QUERY_LIMIT);
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(1_000_000)), MAX_QUERY_LIMIT);
+    }
+
+    #[test]
+    fn clamp_portfolio_history_limit_bounds_values() {
+        assert_eq!(
+            clamp_portfolio_history_limit(None),
+            MAX_PORTFOLIO_HISTORY_QUERY_LIMIT
+        );
+        assert_eq!(clamp_portfolio_history_limit(Some(0)), 1);
+        assert_eq!(
+            clamp_portfolio_history_limit(Some(1_000_000)),
+            MAX_PORTFOLIO_HISTORY_QUERY_LIMIT
+        );
+    }
+
+    #[test]
+    fn compute_order_book_delta_detects_upserts_and_removes() {
+        let previous = test_order_book(
+            "mkt-1",
+            &[("YES", 45, 100, 2), ("NO", 55, 80, 1)],
+            &[("YES", 60, 120, 3)],
+        );
+        let current = test_order_book(
+            "mkt-1",
+            &[("YES", 45, 140, 4), ("NO", 55, 80, 1)],
+            &[("YES", 58, 90, 2)],
+        );
+
+        let delta = compute_order_book_delta("mkt-1", &previous, &current, 3)
+            .expect("expected a non-empty delta");
+        assert_eq!(delta.market_id, "mkt-1");
+        assert_eq!(delta.sequence, 3);
+        assert_eq!(delta.upserts.len(), 2);
+        assert_eq!(delta.removes.len(), 1);
+
+        assert!(delta.upserts.iter().any(|entry| {
+            entry.side == "Buy"
+                && entry.outcome == "YES"
+                && entry.price_ticks == 45
+                && entry.quantity_minor == 140
+                && entry.order_count == 4
+        }));
+        assert!(delta.upserts.iter().any(|entry| {
+            entry.side == "Sell"
+                && entry.outcome == "YES"
+                && entry.price_ticks == 58
+                && entry.quantity_minor == 90
+                && entry.order_count == 2
+        }));
+        assert!(delta.removes.iter().any(|entry| {
+            entry.side == "Sell" && entry.outcome == "YES" && entry.price_ticks == 60
+        }));
+    }
+
+    #[test]
+    fn compute_order_book_delta_returns_none_when_unchanged() {
+        let previous = test_order_book("mkt-2", &[("YES", 40, 10, 1)], &[("YES", 61, 11, 1)]);
+        let current = test_order_book("mkt-2", &[("YES", 40, 10, 1)], &[("YES", 61, 11, 1)]);
+
+        assert!(compute_order_book_delta("mkt-2", &previous, &current, 7).is_none());
     }
 
     #[test]
@@ -4115,5 +4906,47 @@ mod tests {
             Some("jpg")
         );
         assert_eq!(detect_image_extension(None, Some("asset.txt")), None);
+    }
+
+    #[test]
+    fn test_market_fills_perspective_projection() {
+        let row = test_fill_perspective_row(1, "YES", "YES", 4_900, 4_900);
+        let projected = project_market_fill_row(row, Some("YES")).expect("projection");
+        assert_eq!(projected.outcome, "YES");
+        assert_eq!(projected.price_ticks, 4_900);
+    }
+
+    #[test]
+    fn test_market_fills_cross_outcome_perspective() {
+        let row = test_fill_perspective_row(2, "YES", "NO", 6_000, 4_000);
+
+        let yes = project_market_fill_row(row.clone(), Some("YES")).expect("yes perspective");
+        assert_eq!(yes.outcome, "YES");
+        assert_eq!(yes.price_ticks, 6_000);
+
+        let no = project_market_fill_row(row.clone(), Some("NO")).expect("no perspective");
+        assert_eq!(no.outcome, "NO");
+        assert_eq!(no.price_ticks, 4_000);
+
+        let legacy = project_market_fill_row(row, None).expect("legacy perspective");
+        assert_eq!(legacy.outcome, "YES");
+        assert_eq!(legacy.price_ticks, 6_000);
+    }
+
+    #[test]
+    fn test_views_cross_outcome_visibility() {
+        let fill_row = test_fill_perspective_row(3, "YES", "NO", 5_700, 4_300);
+        assert!(project_market_fill_row(fill_row.clone(), Some("YES")).is_some());
+        assert!(project_market_fill_row(fill_row.clone(), Some("NO")).is_some());
+        assert!(project_market_fill_row(fill_row, Some("MAYBE")).is_none());
+
+        let chart_row = test_chart_update_perspective_row(4, "YES", "NO", 5_700, 4_300);
+        let yes_chart = project_market_chart_update_fill_row(chart_row.clone(), Some("YES"))
+            .expect("yes chart projection");
+        assert_eq!(yes_chart.price_ticks, 5_700);
+        let no_chart = project_market_chart_update_fill_row(chart_row.clone(), Some("NO"))
+            .expect("no chart projection");
+        assert_eq!(no_chart.price_ticks, 4_300);
+        assert!(project_market_chart_update_fill_row(chart_row, Some("MAYBE")).is_none());
     }
 }

@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Context as _;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 #[derive(Debug, Default)]
 struct AuthKeySnapshot {
@@ -50,6 +51,7 @@ impl AuthKeyStore {
             r#"
             SELECT api_key, account_id
             FROM user_api_keys
+            WHERE revoked_at IS NULL
             "#,
         )
         .fetch_all(db)
@@ -90,23 +92,27 @@ impl AuthKeyStore {
         api_key: &str,
         account_id: &str,
     ) -> Result<(), anyhow::Error> {
+        let key_id = format!("uak_{}", Uuid::new_v4().simple());
         sqlx::query(
             r#"
             INSERT INTO user_api_keys (
               api_key,
               account_id,
+              key_id,
               created_at,
               updated_at
             )
-            VALUES ($1, $2, now(), now())
+            VALUES ($1, $2, $3, now(), now())
             ON CONFLICT (api_key) DO UPDATE
             SET
               account_id = EXCLUDED.account_id,
+              revoked_at = NULL,
               updated_at = now()
             "#,
         )
         .bind(api_key)
         .bind(account_id)
+        .bind(key_id)
         .execute(db)
         .await
         .context("upsert user API key")?;

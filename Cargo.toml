@@ -9,6 +9,7 @@ members = [
   "crates/ids",
   "crates/ledger-client",
   "crates/trading",
+  "crates/fluid",
 ]
 resolver = "2"
 

@@ -9,12 +9,16 @@ axum = { version = "0.7", features = ["multipart"] }
 dotenvy = "0.15"
 pebble-daml-grpc = { path = "../../crates/daml-grpc" }
 pebble-ids = { path = "../../crates/ids" }
+pebble-fluid = { path = "../../crates/fluid" }
 pebble-trading = { path = "../../crates/trading" }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+base64 = "0.22"
+hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmp-serde = "1"
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "migrate", "chrono", "json"] }
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"

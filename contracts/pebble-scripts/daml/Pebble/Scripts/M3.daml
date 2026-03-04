@@ -22,7 +22,7 @@ partyMatchesHint hint p =
 getOrAllocateParty : Text -> Script Party
 getOrAllocateParty hint = do
   known <- listKnownParties
-  case filter (\pd -> partyMatchesHint hint pd.party) known of
+  case filter (\pd -> partyMatchesHint hint pd.party && pd.isLocal) known of
     (pd :: _) -> pure pd.party
     [] -> allocatePartyByHint (PartyIdHint hint)
 

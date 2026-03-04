@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
+    path::PathBuf,
     time::Duration,
 };
 
@@ -8,6 +9,7 @@ use anyhow::{anyhow, Context as _, Result};
 use axum::{routing::get, Json, Router};
 use chrono::Utc;
 use pebble_daml_grpc::com::daml::ledger::api::v2 as lapi;
+use pebble_fluid::wal::latest_wal_offset;
 use pebble_ids::{parse_account_id, parse_batch_hash, validate_positive_epoch};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use tonic::{metadata::MetadataValue, transport::Endpoint, Request};
@@ -99,6 +101,7 @@ struct AppState {
 struct Config {
     addr: SocketAddr,
     db_url: String,
+    wal_dir: PathBuf,
     committee_party: String,
     ledger_user_id: String,
     auth_header: Option<MetadataValue<tonic::metadata::Ascii>>,
@@ -114,6 +117,9 @@ struct Config {
     account_lock_namespace: i32,
     active_withdrawals_enabled: bool,
     account_writer_enabled: bool,
+    wal_projection_fence_enabled: bool,
+    wal_projection_fence_timeout_ms: u64,
+    wal_projection_fence_poll_ms: u64,
 }
 
 impl Config {
@@ -125,6 +131,12 @@ impl Config {
 
         let db_url = std::env::var("PEBBLE_DB_URL")
             .unwrap_or_else(|_| "postgres://pebble:pebble@127.0.0.1:5432/pebble".to_string());
+        let wal_dir_raw =
+            std::env::var("PEBBLE_WAL_DIR").unwrap_or_else(|_| "data/wal".to_string());
+        if wal_dir_raw.trim().is_empty() {
+            return Err(anyhow!("PEBBLE_WAL_DIR must be non-empty"));
+        }
+        let wal_dir = PathBuf::from(wal_dir_raw);
 
         let committee_party = std::env::var("PEBBLE_COMMITTEE_PARTY")
             .context("PEBBLE_COMMITTEE_PARTY is required")?;
@@ -196,6 +208,31 @@ impl Config {
             Ok(v) => parse_env_bool("PEBBLE_ACCOUNT_WRITER_ENABLE", &v)?,
             Err(_) => false,
         };
+        let wal_projection_fence_enabled =
+            match std::env::var("PEBBLE_CLEARING_WAL_PROJECTION_FENCE_ENABLED") {
+                Ok(v) => parse_env_bool("PEBBLE_CLEARING_WAL_PROJECTION_FENCE_ENABLED", &v)?,
+                Err(_) => true,
+            };
+        let wal_projection_fence_timeout_ms =
+            std::env::var("PEBBLE_CLEARING_WAL_PROJECTION_FENCE_TIMEOUT_MS")
+                .unwrap_or_else(|_| "5000".to_string())
+                .parse::<u64>()
+                .context("parse PEBBLE_CLEARING_WAL_PROJECTION_FENCE_TIMEOUT_MS")?;
+        if wal_projection_fence_timeout_ms == 0 {
+            return Err(anyhow!(
+                "PEBBLE_CLEARING_WAL_PROJECTION_FENCE_TIMEOUT_MS must be > 0"
+            ));
+        }
+        let wal_projection_fence_poll_ms =
+            std::env::var("PEBBLE_CLEARING_WAL_PROJECTION_FENCE_POLL_MS")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse::<u64>()
+                .context("parse PEBBLE_CLEARING_WAL_PROJECTION_FENCE_POLL_MS")?;
+        if wal_projection_fence_poll_ms == 0 {
+            return Err(anyhow!(
+                "PEBBLE_CLEARING_WAL_PROJECTION_FENCE_POLL_MS must be > 0"
+            ));
+        }
 
         let endpoint = Endpoint::from_shared(format!("http://{}:{}", ledger_host, ledger_port))
             .context("build ledger endpoint")?;
@@ -204,6 +241,7 @@ impl Config {
         Ok(Self {
             addr,
             db_url,
+            wal_dir,
             committee_party,
             ledger_user_id,
             auth_header,
@@ -219,6 +257,9 @@ impl Config {
             account_lock_namespace,
             active_withdrawals_enabled,
             account_writer_enabled,
+            wal_projection_fence_enabled,
+            wal_projection_fence_timeout_ms,
+            wal_projection_fence_poll_ms,
         })
     }
 }
@@ -376,6 +417,9 @@ async fn healthz(
       "account_lock_namespace": state.cfg.account_lock_namespace,
       "active_withdrawals_enabled": state.cfg.active_withdrawals_enabled,
       "account_writer_enabled": state.cfg.account_writer_enabled,
+      "wal_projection_fence_enabled": state.cfg.wal_projection_fence_enabled,
+      "wal_projection_fence_timeout_ms": state.cfg.wal_projection_fence_timeout_ms,
+      "wal_projection_fence_poll_ms": state.cfg.wal_projection_fence_poll_ms,
     }))
 }
 
@@ -423,10 +467,14 @@ struct UnsettledFillRow {
     fill_id: String,
     maker_account_id: String,
     taker_account_id: String,
-    price_ticks: i64,
+    maker_price_ticks: i64,
+    taker_price_ticks: i64,
     quantity_minor: i64,
+    maker_side: String,
     taker_side: String,
 }
+
+type AccountFillDeltaMap = BTreeMap<String, (i64, i64)>;
 
 #[derive(sqlx::FromRow)]
 struct PendingMarketSettlementJobRow {
@@ -1965,6 +2013,8 @@ async fn materialize_epoch_deltas_from_fills(
     state: &AppState,
     head: &ClearingHeadRow,
 ) -> Result<()> {
+    wait_for_projection_fence(state).await?;
+
     let mut tx = state
         .db
         .begin()
@@ -1979,12 +2029,12 @@ async fn materialize_epoch_deltas_from_fills(
           f.fill_id,
           f.maker_account_id,
           f.taker_account_id,
-          f.price_ticks,
+          f.maker_price_ticks,
+          f.taker_price_ticks,
           f.quantity_minor,
-          taker.side AS taker_side
+          f.maker_side,
+          f.taker_side
         FROM fills f
-        JOIN orders taker
-          ON taker.order_id = f.taker_order_id
         WHERE f.instrument_admin = $1
           AND f.instrument_id = $2
           AND f.clearing_epoch IS NULL
@@ -1998,41 +2048,7 @@ async fn materialize_epoch_deltas_from_fills(
     .await
     .context("query unsettled fills for epoch materialization")?;
 
-    let mut deltas = BTreeMap::<String, (i64, i64)>::new();
-    let mut fill_ids = Vec::<String>::with_capacity(fills.len());
-
-    for fill in fills {
-        fill_ids.push(fill.fill_id.clone());
-
-        let taker_delta = cash_delta_minor(
-            fill.taker_side.as_str(),
-            fill.price_ticks,
-            fill.quantity_minor,
-        )?;
-        let maker_delta = taker_delta
-            .checked_neg()
-            .ok_or_else(|| anyhow!("maker delta overflow"))?;
-
-        let taker_entry = deltas.entry(fill.taker_account_id).or_insert((0, 0));
-        taker_entry.0 = taker_entry
-            .0
-            .checked_add(taker_delta)
-            .ok_or_else(|| anyhow!("taker delta accumulation overflow"))?;
-        taker_entry.1 = taker_entry
-            .1
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("taker fill count overflow"))?;
-
-        let maker_entry = deltas.entry(fill.maker_account_id).or_insert((0, 0));
-        maker_entry.0 = maker_entry
-            .0
-            .checked_add(maker_delta)
-            .ok_or_else(|| anyhow!("maker delta accumulation overflow"))?;
-        maker_entry.1 = maker_entry
-            .1
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("maker fill count overflow"))?;
-    }
+    let (mut deltas, fill_ids) = summarize_unsettled_fill_deltas(&fills)?;
 
     let mut queued_settlement_job_ids = BTreeSet::<String>::new();
     if state.cfg.market_settlement_enable && !state.cfg.market_settlement_dry_run {
@@ -2200,6 +2216,49 @@ async fn materialize_epoch_deltas_from_fills(
     Ok(())
 }
 
+async fn wait_for_projection_fence(state: &AppState) -> Result<()> {
+    if !state.cfg.wal_projection_fence_enabled {
+        return Ok(());
+    }
+
+    let target_wal_offset =
+        latest_wal_offset(&state.cfg.wal_dir).context("read WAL tail for projection fence")?;
+    let Some(target_wal_offset) = target_wal_offset else {
+        return Ok(());
+    };
+    let target_offset = i64::try_from(target_wal_offset.0)
+        .context("WAL tail offset overflows i64 for projection fence")?;
+
+    let timeout = Duration::from_millis(state.cfg.wal_projection_fence_timeout_ms);
+    let poll = Duration::from_millis(state.cfg.wal_projection_fence_poll_ms);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow!("projection fence deadline overflow"))?;
+
+    loop {
+        let projected_offset: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT last_projected_offset FROM wal_projection_cursor WHERE id = 1), 0)",
+        )
+                .fetch_one(&state.db)
+                .await
+                .context("query wal_projection_cursor for projection fence")?;
+        if projection_fence_satisfied(projected_offset, target_offset) {
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "projection fence timeout with projected_offset={projected_offset}, target_offset={target_offset}"
+            ));
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+fn projection_fence_satisfied(projected_offset: i64, target_offset: i64) -> bool {
+    projected_offset >= target_offset
+}
+
 async fn lock_epoch(tx: &mut Transaction<'_, Postgres>, head: &ClearingHeadRow) -> Result<()> {
     let epoch_key = format!(
         "{}:{}:{}",
@@ -2306,18 +2365,66 @@ fn compute_market_settlement_account_deltas(
     Ok((out, total_delta_minor))
 }
 
-fn cash_delta_minor(taker_side: &str, price_ticks: i64, quantity_minor: i64) -> Result<i64> {
+fn cash_delta_minor(side: &str, price_ticks: i64, quantity_minor: i64) -> Result<i64> {
     let gross = price_ticks
         .checked_mul(quantity_minor)
         .ok_or_else(|| anyhow!("fill cash delta overflow"))?;
 
-    match taker_side {
+    match side {
         "Buy" => gross
             .checked_neg()
             .ok_or_else(|| anyhow!("fill cash delta overflow")),
         "Sell" => Ok(gross),
-        _ => Err(anyhow!("unexpected taker side in fills: {taker_side}")),
+        _ => Err(anyhow!("unexpected fill side in fills: {side}")),
     }
+}
+
+fn summarize_unsettled_fill_deltas(
+    fills: &[UnsettledFillRow],
+) -> Result<(AccountFillDeltaMap, Vec<String>)> {
+    let mut deltas = AccountFillDeltaMap::new();
+    let mut fill_ids = Vec::<String>::with_capacity(fills.len());
+
+    for fill in fills {
+        fill_ids.push(fill.fill_id.clone());
+
+        let taker_delta = cash_delta_minor(
+            fill.taker_side.as_str(),
+            fill.taker_price_ticks,
+            fill.quantity_minor,
+        )?;
+        let maker_delta = cash_delta_minor(
+            fill.maker_side.as_str(),
+            fill.maker_price_ticks,
+            fill.quantity_minor,
+        )?;
+
+        let taker_entry = deltas
+            .entry(fill.taker_account_id.clone())
+            .or_insert((0, 0));
+        taker_entry.0 = taker_entry
+            .0
+            .checked_add(taker_delta)
+            .ok_or_else(|| anyhow!("taker delta accumulation overflow"))?;
+        taker_entry.1 = taker_entry
+            .1
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("taker fill count overflow"))?;
+
+        let maker_entry = deltas
+            .entry(fill.maker_account_id.clone())
+            .or_insert((0, 0));
+        maker_entry.0 = maker_entry
+            .0
+            .checked_add(maker_delta)
+            .ok_or_else(|| anyhow!("maker delta accumulation overflow"))?;
+        maker_entry.1 = maker_entry
+            .1
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("maker fill count overflow"))?;
+    }
+
+    Ok((deltas, fill_ids))
 }
 
 fn compute_batch_hash(
@@ -2465,12 +2572,10 @@ async fn load_account_cumulative_fill_delta(
         FROM (
           SELECT
             CASE
-              WHEN taker.side = 'Buy' THEN -(f.price_ticks * f.quantity_minor)
-              ELSE f.price_ticks * f.quantity_minor
+              WHEN f.taker_side = 'Buy' THEN -(f.taker_price_ticks * f.quantity_minor)
+              ELSE f.taker_price_ticks * f.quantity_minor
             END AS delta_minor
           FROM fills f
-          JOIN orders taker
-            ON taker.order_id = f.taker_order_id
           WHERE f.instrument_admin = $1
             AND f.instrument_id = $2
             AND f.taker_account_id = $3
@@ -2481,12 +2586,10 @@ async fn load_account_cumulative_fill_delta(
 
           SELECT
             CASE
-              WHEN taker.side = 'Buy' THEN f.price_ticks * f.quantity_minor
-              ELSE -(f.price_ticks * f.quantity_minor)
+              WHEN f.maker_side = 'Buy' THEN -(f.maker_price_ticks * f.quantity_minor)
+              ELSE f.maker_price_ticks * f.quantity_minor
             END AS delta_minor
           FROM fills f
-          JOIN orders taker
-            ON taker.order_id = f.taker_order_id
           WHERE f.instrument_admin = $1
             AND f.instrument_id = $2
             AND f.maker_account_id = $3
@@ -2865,12 +2968,10 @@ async fn log_pending_trade_delta_drift_for_instrument(
             SELECT
               f.taker_account_id AS account_id,
               CASE
-                WHEN taker.side = 'Buy' THEN -(f.price_ticks * f.quantity_minor)
-                ELSE f.price_ticks * f.quantity_minor
+                WHEN f.taker_side = 'Buy' THEN -(f.taker_price_ticks * f.quantity_minor)
+                ELSE f.taker_price_ticks * f.quantity_minor
               END AS delta_minor
             FROM fills f
-            JOIN orders taker
-              ON taker.order_id = f.taker_order_id
             JOIN latest_account_state las
               ON las.account_id = f.taker_account_id
             WHERE f.clearing_epoch IS NULL OR f.clearing_epoch > las.last_applied_epoch
@@ -2880,12 +2981,10 @@ async fn log_pending_trade_delta_drift_for_instrument(
             SELECT
               f.maker_account_id AS account_id,
               CASE
-                WHEN taker.side = 'Buy' THEN f.price_ticks * f.quantity_minor
-                ELSE -(f.price_ticks * f.quantity_minor)
+                WHEN f.maker_side = 'Buy' THEN -(f.maker_price_ticks * f.quantity_minor)
+                ELSE f.maker_price_ticks * f.quantity_minor
               END AS delta_minor
             FROM fills f
-            JOIN orders taker
-              ON taker.order_id = f.taker_order_id
             JOIN latest_account_state las
               ON las.account_id = f.maker_account_id
             WHERE f.clearing_epoch IS NULL OR f.clearing_epoch > las.last_applied_epoch
@@ -2940,12 +3039,10 @@ async fn log_pending_trade_delta_drift_for_instrument(
             SELECT
               f.taker_account_id AS account_id,
               CASE
-                WHEN taker.side = 'Buy' THEN -(f.price_ticks * f.quantity_minor)
-                ELSE f.price_ticks * f.quantity_minor
+                WHEN f.taker_side = 'Buy' THEN -(f.taker_price_ticks * f.quantity_minor)
+                ELSE f.taker_price_ticks * f.quantity_minor
               END AS delta_minor
             FROM fills f
-            JOIN orders taker
-              ON taker.order_id = f.taker_order_id
             JOIN latest_account_state las
               ON las.account_id = f.taker_account_id
             WHERE f.clearing_epoch IS NULL OR f.clearing_epoch > las.last_applied_epoch
@@ -2955,12 +3052,10 @@ async fn log_pending_trade_delta_drift_for_instrument(
             SELECT
               f.maker_account_id AS account_id,
               CASE
-                WHEN taker.side = 'Buy' THEN f.price_ticks * f.quantity_minor
-                ELSE -(f.price_ticks * f.quantity_minor)
+                WHEN f.maker_side = 'Buy' THEN -(f.maker_price_ticks * f.quantity_minor)
+                ELSE f.maker_price_ticks * f.quantity_minor
               END AS delta_minor
             FROM fills f
-            JOIN orders taker
-              ON taker.order_id = f.taker_order_id
             JOIN latest_account_state las
               ON las.account_id = f.maker_account_id
             WHERE f.clearing_epoch IS NULL OR f.clearing_epoch > las.last_applied_epoch
@@ -3243,10 +3338,55 @@ mod tests {
     }
 
     #[test]
-    fn cash_delta_minor_signs_by_taker_side() {
+    fn cash_delta_minor_signs_by_side() {
         assert_eq!(cash_delta_minor("Buy", 5, 2).unwrap(), -10);
         assert_eq!(cash_delta_minor("Sell", 5, 2).unwrap(), 10);
         assert!(cash_delta_minor("Unknown", 5, 2).is_err());
+    }
+
+    #[test]
+    fn cash_delta_minor_allows_same_side_party_deltas() {
+        // Cross-outcome fills can have both parties on the same original side.
+        let maker_delta = cash_delta_minor("Buy", 40, 2).unwrap();
+        let taker_delta = cash_delta_minor("Buy", 60, 2).unwrap();
+        assert_eq!(maker_delta, -80);
+        assert_eq!(taker_delta, -120);
+    }
+
+    #[test]
+    fn cash_delta_minor_allows_same_side_sell_party_deltas() {
+        // Cross-outcome fills can also have both parties selling in original-side space.
+        let maker_delta = cash_delta_minor("Sell", 60, 2).unwrap();
+        let taker_delta = cash_delta_minor("Sell", 40, 2).unwrap();
+        assert_eq!(maker_delta, 120);
+        assert_eq!(taker_delta, 80);
+    }
+
+    #[test]
+    fn test_clearing_cross_outcome() {
+        let fills = vec![UnsettledFillRow {
+            fill_id: "fill-1".to_string(),
+            maker_account_id: "maker-buy-no".to_string(),
+            taker_account_id: "taker-buy-yes".to_string(),
+            maker_price_ticks: 4_000,
+            taker_price_ticks: 6_000,
+            quantity_minor: 3,
+            maker_side: "Buy".to_string(),
+            taker_side: "Buy".to_string(),
+        }];
+
+        let (deltas, fill_ids) = summarize_unsettled_fill_deltas(&fills).unwrap();
+        assert_eq!(fill_ids, vec!["fill-1".to_string()]);
+        assert_eq!(
+            deltas.get("maker-buy-no"),
+            Some(&(-12_000, 1)),
+            "maker uses NO-space execution price"
+        );
+        assert_eq!(
+            deltas.get("taker-buy-yes"),
+            Some(&(-18_000, 1)),
+            "taker uses YES-space execution price"
+        );
     }
 
     #[test]
@@ -3328,5 +3468,12 @@ mod tests {
         let epoch_delta_minor = fill_pending_delta_minor + settlement_delta_minor;
         assert_eq!(epoch_delta_minor, 300);
         assert_ne!(fill_pending_delta_minor, epoch_delta_minor);
+    }
+
+    #[test]
+    fn projection_fence_satisfied_only_when_cursor_reaches_target() {
+        assert!(projection_fence_satisfied(10, 10));
+        assert!(projection_fence_satisfied(11, 10));
+        assert!(!projection_fence_satisfied(9, 10));
     }
 }
